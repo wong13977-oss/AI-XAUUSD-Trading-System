@@ -1,0 +1,17 @@
+{
+  "name": "ai-trading-server",
+  "version": "2.0.0",
+  "main": "src/server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "simulate": "node src/simulate.js",
+    "backtest:csv": "node src/backtest_from_csv.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "dotenv": "^16.4.0",
+    "fs-extra": "^11.2.0",
+    "openai": "^4.0.0"
+  }
+}
