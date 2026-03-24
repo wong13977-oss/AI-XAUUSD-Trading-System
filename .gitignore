@@ -1,0 +1,14 @@
+# Dependencies
+ai-server/node_modules/
+
+# Local environment secrets
+ai-server/.env
+
+# Runtime-generated state
+ai-server/src/learning_state.json
+ai-server/src/pending_trades.json
+ai-server/src/strategy_notes.json
+ai-server/src/trades.json
+ai-server/src/usage_state.json
+ai-server/src/simulation_state/*.json
+ai-server/src/monthly_estimate_state/*.json
