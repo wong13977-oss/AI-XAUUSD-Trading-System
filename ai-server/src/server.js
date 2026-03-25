@@ -915,7 +915,7 @@ function learningAdjustments(data, baseScore) {
 
   let scoreAdj = 0;
   let skip = false;
-  let note = "NO_HISTORY";
+  let note = stats.total > 0 ? "EARLY_HISTORY" : "NO_HISTORY";
 
   // 样本不足，不做激进调整
   if (stats.total < 5) {
@@ -936,12 +936,12 @@ function learningAdjustments(data, baseScore) {
   } else if (stats.winRate >= 0.55 && stats.avgRR >= 0) {
     scoreAdj += 0.05;
     note = "DECENT_BUCKET";
-  } else if (stats.winRate < 0.4 && stats.total >= 8) {
-    scoreAdj -= 0.12;
-    note = "WEAK_BUCKET";
   } else if (stats.winRate < 0.33 && stats.total >= 10) {
     scoreAdj -= 0.2;
     note = "BAD_BUCKET";
+  } else if (stats.winRate < 0.4 && stats.total >= 8) {
+    scoreAdj -= 0.12;
+    note = "WEAK_BUCKET";
   } else {
     note = "NEUTRAL_BUCKET";
   }

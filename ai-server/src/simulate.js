@@ -328,6 +328,76 @@ async function main() {
       }
     }
 
+    const degradedBucketScenario = makeScenario({
+      session: "LONDON",
+      trend: "up",
+      trend_bias: "BULL",
+      setup_tag: "TREND_PULLBACK_BUY",
+      rsi: 58,
+      atr_points: 520,
+      spread_points: 18,
+      body1_points: 74,
+      range1_points: 190,
+      close_to_ema20_points: 35,
+      result: "LOSS",
+      pnl: -13.8,
+      rr_result: -1.0,
+      close_reason: "SL_OR_STOP",
+    });
+
+    for (let i = 0; i < 9; i += 1) {
+      const decisionRes = await requestJson(
+        "POST",
+        "/decision",
+        degradedBucketScenario.decision,
+      );
+      if (decisionRes.status !== 200) {
+        throw new Error(`Degraded decision failed with status ${decisionRes.status}`);
+      }
+
+      const decision = decisionRes.body;
+      if (!["BUY", "SELL"].includes(decision.action)) {
+        throw new Error(
+          `Expected degraded bucket setup to remain tradable before hard block, got ${decision.action}`,
+        );
+      }
+
+      const tradeResultRes = await requestJson("POST", "/trade-result", {
+        trade_id: decision.trade_id,
+        ...degradedBucketScenario.result,
+      });
+
+      if (tradeResultRes.status !== 200 || tradeResultRes.body.ok !== true) {
+        throw new Error("Degraded bucket trade result reporting failed.");
+      }
+    }
+
+    const learningBlockRes = await requestJson(
+      "POST",
+      "/decision",
+      degradedBucketScenario.decision,
+    );
+    if (learningBlockRes.status !== 200) {
+      throw new Error(
+        `Expected learning-block decision to succeed, got ${learningBlockRes.status}`,
+      );
+    }
+    if (learningBlockRes.body.route_tier !== "LEARNING_BLOCK") {
+      throw new Error(
+        `Expected LEARNING_BLOCK route, got ${learningBlockRes.body.route_tier}`,
+      );
+    }
+    if (learningBlockRes.body.action !== "SKIP") {
+      throw new Error(
+        `Expected hard-blocked degraded bucket to SKIP, got ${learningBlockRes.body.action}`,
+      );
+    }
+    if (learningBlockRes.body.reason_code !== "BAD_HISTORICAL_BUCKET") {
+      throw new Error(
+        `Expected BAD_HISTORICAL_BUCKET, got ${learningBlockRes.body.reason_code}`,
+      );
+    }
+
     const skipDecisionRes = await requestJson("POST", "/decision", {
       symbol: "XAUUSD",
       timeframe: "PERIOD_M15",
@@ -365,9 +435,9 @@ async function main() {
 
     const pending = await fs.readJson(path.join(simDataDir, "pending_trades.json"));
 
-    if (learningStatus.body.global.total !== 10) {
+    if (learningStatus.body.global.total !== 19) {
       throw new Error(
-        `Expected 10 learned trades, got ${learningStatus.body.global.total}`,
+        `Expected 19 learned trades, got ${learningStatus.body.global.total}`,
       );
     }
 
@@ -390,6 +460,7 @@ async function main() {
     console.log("[sim] learning", learningStatus.body);
     console.log("[sim] usage", usageStatus.body);
     console.log("[sim] strategy_notes", strategyNotes.body);
+    console.log("[sim] learning_block", learningBlockRes.body);
     console.log("[sim] skip_decision", skipDecisionRes.body);
     console.log("[sim] PASS");
   } finally {

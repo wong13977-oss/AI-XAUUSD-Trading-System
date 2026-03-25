@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node src/server.js",
     "simulate": "node src/simulate.js",
+    "compat-check": "node src/simulate.js",
     "backtest:csv": "node src/backtest_from_csv.js"
   },
   "dependencies": {
