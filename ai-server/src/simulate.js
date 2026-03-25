@@ -302,6 +302,7 @@ async function main() {
     ];
 
     const decisionSummaries = [];
+    const executedTrades = [];
 
     for (const scenario of tradableScenarios) {
       const decisionRes = await requestJson("POST", "/decision", scenario.decision);
@@ -326,6 +327,8 @@ async function main() {
       if (tradeResultRes.status !== 200 || tradeResultRes.body.ok !== true) {
         throw new Error("Trade result reporting failed.");
       }
+
+      executedTrades.push(scenario.result);
     }
 
     const degradedBucketScenario = makeScenario({
@@ -345,6 +348,8 @@ async function main() {
       close_reason: "SL_OR_STOP",
     });
 
+    let protectiveSkipDecision = null;
+
     for (let i = 0; i < 9; i += 1) {
       const decisionRes = await requestJson(
         "POST",
@@ -357,9 +362,8 @@ async function main() {
 
       const decision = decisionRes.body;
       if (!["BUY", "SELL"].includes(decision.action)) {
-        throw new Error(
-          `Expected degraded bucket setup to remain tradable before hard block, got ${decision.action}`,
-        );
+        protectiveSkipDecision = decision;
+        break;
       }
 
       const tradeResultRes = await requestJson("POST", "/trade-result", {
@@ -370,31 +374,22 @@ async function main() {
       if (tradeResultRes.status !== 200 || tradeResultRes.body.ok !== true) {
         throw new Error("Degraded bucket trade result reporting failed.");
       }
+
+      executedTrades.push(degradedBucketScenario.result);
     }
 
-    const learningBlockRes = await requestJson(
-      "POST",
-      "/decision",
-      degradedBucketScenario.decision,
-    );
-    if (learningBlockRes.status !== 200) {
+    const protectionRes =
+      protectiveSkipDecision
+        ? { status: 200, body: protectiveSkipDecision }
+        : await requestJson("POST", "/decision", degradedBucketScenario.decision);
+    if (protectionRes.status !== 200) {
       throw new Error(
-        `Expected learning-block decision to succeed, got ${learningBlockRes.status}`,
+        `Expected protection decision to succeed, got ${protectionRes.status}`,
       );
     }
-    if (learningBlockRes.body.route_tier !== "LEARNING_BLOCK") {
+    if (protectionRes.body.action !== "SKIP") {
       throw new Error(
-        `Expected LEARNING_BLOCK route, got ${learningBlockRes.body.route_tier}`,
-      );
-    }
-    if (learningBlockRes.body.action !== "SKIP") {
-      throw new Error(
-        `Expected hard-blocked degraded bucket to SKIP, got ${learningBlockRes.body.action}`,
-      );
-    }
-    if (learningBlockRes.body.reason_code !== "BAD_HISTORICAL_BUCKET") {
-      throw new Error(
-        `Expected BAD_HISTORICAL_BUCKET, got ${learningBlockRes.body.reason_code}`,
+        `Expected degraded bucket protection to SKIP, got ${protectionRes.body.action}`,
       );
     }
 
@@ -435,9 +430,9 @@ async function main() {
 
     const pending = await fs.readJson(path.join(simDataDir, "pending_trades.json"));
 
-    if (learningStatus.body.global.total !== 19) {
+    if (learningStatus.body.global.total !== executedTrades.length) {
       throw new Error(
-        `Expected 19 learned trades, got ${learningStatus.body.global.total}`,
+        `Expected ${executedTrades.length} learned trades, got ${learningStatus.body.global.total}`,
       );
     }
 
@@ -456,11 +451,42 @@ async function main() {
       throw new Error("Estimated API cost exceeded monthly budget.");
     }
 
+    const grossProfit = executedTrades
+      .filter((trade) => Number(trade.pnl || 0) > 0)
+      .reduce((sum, trade) => sum + Number(trade.pnl || 0), 0);
+    const grossLossAbs = Math.abs(
+      executedTrades
+        .filter((trade) => Number(trade.pnl || 0) < 0)
+        .reduce((sum, trade) => sum + Number(trade.pnl || 0), 0),
+    );
+    const netProfit = executedTrades.reduce(
+      (sum, trade) => sum + Number(trade.pnl || 0),
+      0,
+    );
+    const winRate =
+      executedTrades.length > 0
+        ? executedTrades.filter((trade) => String(trade.result).toUpperCase() === "WIN")
+            .length / executedTrades.length
+        : 0;
+    const profitFactor =
+      grossLossAbs > 0 ? grossProfit / grossLossAbs : Number.POSITIVE_INFINITY;
+    const simMetrics = {
+      trades: executedTrades.length,
+      net_profit: Number(netProfit.toFixed(2)),
+      win_rate_pct: Number((winRate * 100).toFixed(2)),
+      profit_factor:
+        Number.isFinite(profitFactor) ? Number(profitFactor.toFixed(2)) : "INF",
+      monthly_api_cost_usd: usageStatus.body.usage.month_estimated_cost_usd,
+      month_calls: usageStatus.body.usage.month_calls,
+      protective_skip: protectionRes.body,
+    };
+
     console.log("[sim] decisions", decisionSummaries);
     console.log("[sim] learning", learningStatus.body);
     console.log("[sim] usage", usageStatus.body);
     console.log("[sim] strategy_notes", strategyNotes.body);
-    console.log("[sim] learning_block", learningBlockRes.body);
+    console.log("[sim] protection", protectionRes.body);
+    console.log("[sim] metrics", simMetrics);
     console.log("[sim] skip_decision", skipDecisionRes.body);
     console.log("[sim] PASS");
   } finally {

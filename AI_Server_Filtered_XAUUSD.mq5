@@ -28,6 +28,9 @@ input int    InpATRPeriod                = 14;
 input int    InpMaxSpreadPoints          = 100;
 input int    InpMinATRPoints             = 130;
 input int    InpMinConfidence            = 70;
+input double InpMaxEntryStretchATR       = 0.78;
+input double InpMaxImpulseRangeATR       = 1.20;
+input double InpMaxImpulseBodyShare      = 0.78;
 input int    InpCooldownBars             = 1;
 input bool   InpOnePositionOnly          = true;
 input bool   InpAllowBuy                 = true;
@@ -561,7 +564,31 @@ bool DetectPullbackCandidate(string bias, double close1, double high1, double lo
    return false;
 }
 
-bool PreFilterPass(double spread_points, double atr_points, string bias, bool pullbackOk)
+bool IsCalmEntryStructure(double atr_points, double body1_points, double range1_points, double closeToEMA20_points)
+{
+   if(atr_points <= 0.0)
+      return false;
+
+   double stretchRatio = closeToEMA20_points / atr_points;
+   double rangeRatio = range1_points / atr_points;
+   double bodyShare = (range1_points > 0.0 ? body1_points / range1_points : 0.0);
+
+   if(stretchRatio > InpMaxEntryStretchATR)
+   {
+      DebugPrint("Skip: entry too stretched from EMA20");
+      return false;
+   }
+
+   if(rangeRatio > InpMaxImpulseRangeATR && bodyShare > InpMaxImpulseBodyShare)
+   {
+      DebugPrint("Skip: climactic impulse bar");
+      return false;
+   }
+
+   return true;
+}
+
+bool PreFilterPass(double spread_points, double atr_points, string bias, bool pullbackOk, double body1_points, double range1_points, double closeToEMA20_points)
 {
    if(!InpEnablePreFilter)
       return true;
@@ -609,6 +636,10 @@ bool PreFilterPass(double spread_points, double atr_points, string bias, bool pu
    if(!pullbackOk)
    {
       DebugPrint("Skip: no pullback setup");
+      return false;
+   }
+   if(!IsCalmEntryStructure(atr_points, body1_points, range1_points, closeToEMA20_points))
+   {
       return false;
    }
    return true;
@@ -752,24 +783,23 @@ bool RequestDecision(string &responseText)
    DetectTrendBias(bias, emaFast, emaSlow, ema20, rates[0].close);
 
    string setupTag = "NONE";
+   double body1 = MathAbs(rates[0].close - rates[0].open) / point;
+   double range1 = MathAbs(rates[0].high - rates[0].low) / point;
+   double closeToEMA20 = MathAbs(rates[0].close - ema20) / point;
    bool pullbackOk = DetectPullbackCandidate(bias, rates[0].close, rates[0].high, rates[0].low, emaFast, ema20, atr_points, setupTag);
 
-   if(!PreFilterPass(spread_points, atr_points, bias, pullbackOk))
+   if(!PreFilterPass(spread_points, atr_points, bias, pullbackOk, body1, range1, closeToEMA20))
       return false;
       
    string trend = "range";
-if(bias == "BULL") trend = "up";
-else if(bias == "BEAR") trend = "down";
+   if(bias == "BULL") trend = "up";
+   else if(bias == "BEAR") trend = "down";
 
    bool hasPos = HasOpenPosition(InpSymbol);
    int posType = GetPositionType(InpSymbol);
    string posTypeStr = "";
    if(posType == POSITION_TYPE_BUY) posTypeStr = "BUY";
    if(posType == POSITION_TYPE_SELL) posTypeStr = "SELL";
-
-   double body1 = MathAbs(rates[0].close - rates[0].open) / point;
-   double range1 = MathAbs(rates[0].high - rates[0].low) / point;
-   double closeToEMA20 = MathAbs(rates[0].close - ema20) / point;
    
    string payload = StringFormat(
    "{"
@@ -1248,7 +1278,8 @@ void ProcessDecision(const string response)
    g_lastDecisionModel    = model;
    g_lastDecisionSLPoints = sl_points;
    g_lastDecisionTPPoints = tp_points;
-   g_lastDecisionRiskPct  = (risk_percent > 0.0 ? risk_percent : InpRiskPercentFallback);
+   double serverRisk = (risk_percent > 0.0 ? risk_percent : InpRiskPercentFallback);
+   g_lastDecisionRiskPct  = MathMax(0.12, MathMin(0.40, serverRisk));
 
    if(InpPrintDecisionSummary)
    {

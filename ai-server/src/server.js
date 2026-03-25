@@ -147,6 +147,102 @@ function pct(v) {
   return `${round2(v * 100)}%`;
 }
 
+function asArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function normalizeSessionBiasValue(value) {
+  if (Number.isFinite(Number(value))) {
+    return clamp(Number(value), -0.18, 0.18);
+  }
+
+  const text = String(value || "")
+    .trim()
+    .toLowerCase();
+
+  if (!text) return 0;
+  if (text === "positive") return 0.05;
+  if (text === "slight_positive") return 0.03;
+  if (text === "negative") return -0.06;
+  if (text === "slight_negative") return -0.03;
+  if (text === "neutral") return 0;
+  return 0;
+}
+
+function normalizeBucketAdjustmentValue(value, fallback = 0) {
+  if (Number.isFinite(Number(value))) {
+    return clamp(Number(value), -0.2, 0.2);
+  }
+
+  const text = String(value || "")
+    .trim()
+    .toLowerCase();
+
+  if (!text) return fallback;
+  if (text === "boost" || text === "positive") return 0.06;
+  if (text === "small" || text === "+small" || text === "slight_positive")
+    return 0.03;
+  if (text === "avoid" || text === "negative") return -0.08;
+  if (text === "hard_avoid" || text === "block") return -0.14;
+  return fallback;
+}
+
+function normalizeBucketRuleEntry(entry, fallbackAdjustment = 0) {
+  if (typeof entry === "string") {
+    return {
+      bucket: entry,
+      adjustment: normalizeBucketAdjustmentValue(fallbackAdjustment, fallbackAdjustment),
+      risk_multiplier: 1,
+      note: "",
+    };
+  }
+
+  if (entry && typeof entry === "object") {
+    return {
+      bucket: String(entry.bucket || ""),
+      adjustment: normalizeBucketAdjustmentValue(
+        entry.adjustment,
+        fallbackAdjustment,
+      ),
+      risk_multiplier: clamp(
+        Number(entry.risk_multiplier ?? 1),
+        0.25,
+        1.25,
+      ),
+      note: String(entry.reason || entry.note || ""),
+    };
+  }
+
+  return null;
+}
+
+function computeEntryQualityMetrics(data) {
+  const atr = Math.max(1, safeNumber(data.atr_points ?? data.atr, 0));
+  const range1 = safeNumber(data.range1_points, 0);
+  const body1 = safeNumber(data.body1_points, 0);
+  const closeToEma20 = safeNumber(data.close_to_ema20_points, 0);
+  const spread = safeNumber(data.spread_points ?? data.spread, 0);
+
+  const stretchRatio = closeToEma20 / atr;
+  const rangeRatio = range1 / atr;
+  const bodyRatio = body1 / atr;
+  const bodyShare = range1 > 0 ? body1 / range1 : 0;
+
+  return {
+    atr,
+    spread,
+    stretchRatio,
+    rangeRatio,
+    bodyRatio,
+    bodyShare,
+    farExtended: stretchRatio >= 1.05,
+    stretched: stretchRatio >= 0.82,
+    mildlyExtended: stretchRatio >= 0.65,
+    climactic: rangeRatio >= 1.2 && bodyShare >= 0.72,
+    impulsive: rangeRatio >= 0.95 && bodyRatio >= 0.55,
+  };
+}
+
 function signed(n) {
   const x = safeNumber(n, 0);
   return x > 0 ? `+${round2(x)}` : `${round2(x)}`;
@@ -840,6 +936,7 @@ function localScore(data) {
   const rsi = safeNumber(data.rsi, 0);
   const atrPoints = safeNumber(data.atr_points ?? data.atr, 0);
   const spread = safeNumber(data.spread_points ?? data.spread, 999);
+  const quality = computeEntryQualityMetrics(data);
 
   const body1 = safeNumber(data.body1_points, 0);
   const range1 = safeNumber(data.range1_points, 0);
@@ -876,6 +973,12 @@ function localScore(data) {
   // 接近 EMA20 回踩
   if (closeToEma20 <= 150) score += 0.1;
   else if (closeToEma20 <= 220) score += 0.05;
+
+  if (quality.mildlyExtended) score -= 0.05;
+  if (quality.stretched) score -= 0.11;
+  if (quality.climactic) score -= 0.14;
+  else if (quality.impulsive) score -= 0.07;
+  if (spread > 35) score -= 0.04;
 
   // 风险抑制
   if (hasPosition) score -= 0.2;
@@ -918,7 +1021,7 @@ function learningAdjustments(data, baseScore) {
   let note = stats.total > 0 ? "EARLY_HISTORY" : "NO_HISTORY";
 
   // 样本不足，不做激进调整
-  if (stats.total < 5) {
+  if (stats.total < 4) {
     return {
       bucketKey,
       stats,
@@ -936,6 +1039,9 @@ function learningAdjustments(data, baseScore) {
   } else if (stats.winRate >= 0.55 && stats.avgRR >= 0) {
     scoreAdj += 0.05;
     note = "DECENT_BUCKET";
+  } else if (stats.total >= 4 && stats.winRate < 0.35 && stats.avgRR < 0) {
+    scoreAdj -= 0.08;
+    note = "EARLY_WEAK_BUCKET";
   } else if (stats.winRate < 0.33 && stats.total >= 10) {
     scoreAdj -= 0.2;
     note = "BAD_BUCKET";
@@ -947,7 +1053,7 @@ function learningAdjustments(data, baseScore) {
   }
 
   // 极差 bucket：直接拦
-  if (stats.total >= 12 && stats.winRate < 0.3 && stats.avgRR <= 0) {
+  if (stats.total >= 10 && stats.winRate < 0.28 && stats.avgRR < -0.1) {
     skip = true;
     note = "HARD_BLOCK_BAD_BUCKET";
   }
@@ -967,35 +1073,72 @@ function applyStrategyNotesAdjustment(data, score) {
   const bucketKey = buildBucketKey(data);
 
   let adj = 0;
+  let riskMultiplier = 1;
   let note = "NO_STRATEGY_NOTE";
 
-  if (
-    Array.isArray(notes.boost_buckets) &&
-    notes.boost_buckets.includes(bucketKey)
-  ) {
-    adj += 0.04;
-    note = "BOOST_BUCKET";
+  const boostRule = asArray(notes.boost_buckets)
+    .map((entry) => normalizeBucketRuleEntry(entry, 0.04))
+    .find((entry) => entry?.bucket === bucketKey);
+
+  if (boostRule) {
+    adj += boostRule.adjustment;
+    riskMultiplier *= boostRule.risk_multiplier;
+    note = boostRule.note ? `BOOST_BUCKET:${boostRule.note}` : "BOOST_BUCKET";
   }
 
-  if (
-    Array.isArray(notes.avoid_buckets) &&
-    notes.avoid_buckets.includes(bucketKey)
-  ) {
-    adj -= 0.06;
-    note = "AVOID_BUCKET";
+  const avoidRule = asArray(notes.avoid_buckets)
+    .map((entry) => normalizeBucketRuleEntry(entry, -0.08))
+    .find((entry) => entry?.bucket === bucketKey);
+
+  if (avoidRule) {
+    adj += avoidRule.adjustment;
+    riskMultiplier *= Math.min(1, avoidRule.risk_multiplier || 0.75);
+    note = avoidRule.note ? `AVOID_BUCKET:${avoidRule.note}` : "AVOID_BUCKET";
   }
 
   const session = String(data.session || "").toUpperCase();
-  if (
-    notes.session_bias &&
-    Number.isFinite(Number(notes.session_bias[session]))
-  ) {
-    adj += Number(notes.session_bias[session]);
-    note = `SESSION_BIAS_${session}`;
+  if (notes.session_bias && notes.session_bias[session] != null) {
+    const sessionAdj = normalizeSessionBiasValue(notes.session_bias[session]);
+    adj += sessionAdj;
+    if (sessionAdj !== 0) {
+      note = `SESSION_BIAS_${session}`;
+    }
+  }
+
+  const quality = computeEntryQualityMetrics(data);
+  for (const rule of asArray(notes.confidence_adjustments)) {
+    if (!rule || typeof rule !== "object") continue;
+
+    if (rule.type === "stretch_penalty") {
+      const minStretch = Number(rule.min_stretch_ratio ?? 0.7);
+      if (quality.stretchRatio >= minStretch) {
+        adj += normalizeBucketAdjustmentValue(rule.adjustment, -0.08);
+        riskMultiplier *= clamp(Number(rule.risk_multiplier ?? 0.8), 0.25, 1);
+        note = "STRETCH_PENALTY";
+      }
+    }
+
+    if (rule.type === "session_setup_penalty") {
+      const matchSession =
+        !rule.session || String(rule.session).toUpperCase() === session;
+      const matchSetup =
+        !rule.setup_tag ||
+        String(rule.setup_tag).toUpperCase() === normalizeSetupTag(data.setup_tag);
+      const matchTrend =
+        !rule.trend_bias ||
+        String(rule.trend_bias).toUpperCase() === normalizeTrendBias(data.trend_bias);
+
+      if (matchSession && matchSetup && matchTrend) {
+        adj += normalizeBucketAdjustmentValue(rule.adjustment, -0.06);
+        riskMultiplier *= clamp(Number(rule.risk_multiplier ?? 0.8), 0.25, 1);
+        note = "SESSION_SETUP_PENALTY";
+      }
+    }
   }
 
   return {
     strategyAdj: adj,
+    riskMultiplier: clamp(riskMultiplier, 0.25, 1.2),
     strategyNote: note,
     scoreAfterStrategy: clamp(score + adj, 0, 1),
   };
@@ -1042,6 +1185,7 @@ function buildProfessionalDecision(data) {
   const dailyLossHit = data.daily_loss_hit === true;
   const setup = normalizeSetupTag(data.setup_tag);
   const trendBias = normalizeTrendBias(data.trend_bias);
+  const quality = computeEntryQualityMetrics(data);
 
   if (hasPosition) {
     return {
@@ -1098,7 +1242,7 @@ function buildProfessionalDecision(data) {
     };
   }
 
-  if (range1 >= atr * 1.7 && body1 >= range1 * 0.82) {
+  if (quality.climactic || (range1 >= atr * 1.45 && body1 >= range1 * 0.76)) {
     return {
       action: "SKIP",
       confidence: 44,
@@ -1109,7 +1253,7 @@ function buildProfessionalDecision(data) {
     };
   }
 
-  if (closeToEma20 >= atr * 1.05) {
+  if (quality.farExtended || closeToEma20 >= atr * 0.9) {
     return {
       action: "SKIP",
       confidence: 46,
@@ -1130,6 +1274,9 @@ function buildProfessionalDecision(data) {
   if (body1 >= 35 && body1 <= atr * 0.5) confidence += 3;
   if (closeToEma20 <= atr * 0.38) confidence += 5;
   else if (closeToEma20 <= atr * 0.55) confidence += 2;
+  if (quality.stretched) confidence -= 10;
+  else if (quality.mildlyExtended) confidence -= 4;
+  if (quality.impulsive) confidence -= 6;
 
   if (actionBias === "BUY") {
     if (trendBias === "BULL") confidence += 4;
@@ -1152,7 +1299,7 @@ function buildProfessionalDecision(data) {
     confidence >= 82 ? 2.1 : confidence >= 76 ? 1.9 : confidence >= 70 ? 1.75 : 1.6;
   const tpPoints = round2(slPoints * rrTarget);
   const riskPercent = round2(
-    confidence >= 82 ? 0.45 : confidence >= 76 ? 0.38 : 0.3,
+    confidence >= 82 ? 0.4 : confidence >= 76 ? 0.32 : 0.24,
   );
 
   if (confidence < 70) {
@@ -1199,12 +1346,22 @@ function buildStrategyNotesLocally(trades, buckets, global) {
   const boostBuckets = buckets
     .filter((b) => b.total >= 3 && b.win_rate >= 60 && b.avg_rr > 0)
     .slice(0, 5)
-    .map((b) => b.key);
+    .map((b) => ({
+      bucket: b.key,
+      adjustment: b.win_rate >= 70 ? 0.04 : 0.02,
+      risk_multiplier: b.win_rate >= 70 ? 1.05 : 1,
+      reason: "Recent bucket performance is constructive but still risk-aware.",
+    }));
 
   const avoidBuckets = buckets
     .filter((b) => b.total >= 3 && b.win_rate <= 40 && b.avg_rr <= 0)
     .slice(0, 5)
-    .map((b) => b.key);
+    .map((b) => ({
+      bucket: b.key,
+      adjustment: b.win_rate <= 30 ? -0.12 : -0.08,
+      risk_multiplier: b.win_rate <= 30 ? 0.55 : 0.7,
+      reason: "Recent bucket is underperforming and should be de-risked.",
+    }));
 
   const sessionMap = trades.reduce((acc, trade) => {
     const session = String(trade.learned_context?.session || "NA").toUpperCase();
@@ -1232,7 +1389,14 @@ function buildStrategyNotesLocally(trades, buckets, global) {
     boost_buckets: boostBuckets,
     avoid_buckets: avoidBuckets,
     session_bias: sessionBias,
-    confidence_adjustments: {},
+    confidence_adjustments: [
+      {
+        type: "stretch_penalty",
+        min_stretch_ratio: 0.75,
+        adjustment: -0.08,
+        risk_multiplier: 0.8,
+      },
+    ],
   };
 }
 
@@ -1357,6 +1521,51 @@ function buildDecisionResponse({
     risk_percent: round2(riskPercent),
     source: String(source || "LOCAL").toUpperCase(),
     model: String(model || "LOCAL").toUpperCase(),
+  };
+}
+
+function buildRiskPlan(data, learn, strategy, reviewedResult) {
+  const quality = computeEntryQualityMetrics(data);
+  let confidencePenalty = 0;
+  let riskMultiplier = clamp(
+    Number(strategy?.riskMultiplier ?? 1),
+    0.25,
+    1.2,
+  );
+
+  if (quality.mildlyExtended) {
+    confidencePenalty += 4;
+    riskMultiplier *= 0.9;
+  }
+  if (quality.stretched) {
+    confidencePenalty += 9;
+    riskMultiplier *= 0.75;
+  }
+  if (quality.climactic) {
+    confidencePenalty += 12;
+    riskMultiplier *= 0.65;
+  } else if (quality.impulsive) {
+    confidencePenalty += 6;
+    riskMultiplier *= 0.82;
+  }
+
+  if (learn?.stats?.total >= 4 && learn?.stats?.winRate < 0.35 && learn?.stats?.avgRR < 0) {
+    confidencePenalty += 6;
+    riskMultiplier *= 0.72;
+  }
+  if (learn?.stats?.total >= 8 && learn?.stats?.winRate < 0.4 && learn?.stats?.avgRR <= 0) {
+    confidencePenalty += 8;
+    riskMultiplier *= 0.7;
+  }
+
+  const adjustedRisk = round2(
+    clamp(safeNumber(reviewedResult?.risk_percent, 0.28) * riskMultiplier, 0.12, 0.5),
+  );
+
+  return {
+    confidencePenalty,
+    riskPercent: adjustedRisk,
+    riskMultiplier: clamp(riskMultiplier, 0.25, 1.2),
   };
 }
 
@@ -1495,24 +1704,44 @@ app.post("/decision", async (req, res) => {
   }
 
   // 3) 很高分直接本地放行，不打 API
-  if (finalLocalScore >= 0.83) {
-    const action =
-      normalizeTrendBias(data.trend_bias) === "BULL" ||
-      String(data.trend || "").toLowerCase() === "up"
-        ? "BUY"
-        : "SELL";
+  const allowLocalBypass =
+    finalLocalScore >= 0.88 &&
+    (learn.stats.total < 6 ||
+      (learn.stats.winRate >= 0.55 && learn.stats.avgRR > 0));
+
+  if (allowLocalBypass) {
+    const localDecision = buildProfessionalDecision(data);
+    const riskPlan = buildRiskPlan(data, learn, strategy, localDecision);
+    const localConfidence = clamp(
+      Math.max(safeNumber(localDecision.confidence, 0), finalLocalScore * 100) -
+        riskPlan.confidencePenalty,
+      0,
+      100,
+    );
+    const localAction =
+      localDecision.action !== "SKIP" && localConfidence >= 72
+        ? localDecision.action
+        : "SKIP";
 
     const response = buildDecisionResponse({
       tradeId,
       routeTier: "LOCAL_HIGH_CONF",
-      action,
-      confidence: finalLocalScore * 100,
-      reasonCode: "HIGH_LOCAL_SCORE",
+      action: localAction,
+      confidence: localConfidence,
+      reasonCode:
+        localAction === "SKIP"
+          ? localDecision.reason_code || "LOCAL_HIGH_CONF_SKIP"
+          : localDecision.reason_code || "HIGH_LOCAL_SCORE",
+      slPoints: localAction === "SKIP" ? 0 : localDecision.sl_points,
+      tpPoints: localAction === "SKIP" ? 0 : localDecision.tp_points,
+      riskPercent: localAction === "SKIP" ? 0 : riskPlan.riskPercent,
       source: "LOCAL_HIGH_CONF",
       model: "LOCAL",
     });
 
-    savePendingDecision(tradeId, buildSnapshotForLearning(data, response));
+    if (response.action === "BUY" || response.action === "SELL") {
+      savePendingDecision(tradeId, buildSnapshotForLearning(data, response));
+    }
 
     printDecisionSummary({
       tradeId,
@@ -1614,10 +1843,12 @@ app.post("/decision", async (req, res) => {
       }
     }
 
+    const riskPlan = buildRiskPlan(data, learn, strategy, reviewedResult);
     let adjustedConfidence = clamp(
       safeNumber(reviewedResult.confidence, 0) +
         learn.scoreAdj * 100 +
-        strategy.strategyAdj * 100,
+        strategy.strategyAdj * 100 -
+        riskPlan.confidencePenalty,
       0,
       100,
     );
@@ -1684,7 +1915,8 @@ app.post("/decision", async (req, res) => {
       reasonCode: reviewedResult.reason_code || "GPT_DECISION",
       slPoints: reviewedResult.sl_points,
       tpPoints: reviewedResult.tp_points,
-      riskPercent: reviewedResult.risk_percent,
+      riskPercent:
+        finalAction === "SKIP" ? 0 : riskPlan.riskPercent,
       routeTier: finalRouteTier,
       source: decisionSourceLabel(),
       model: decisionModelLabel(finalModelUsed),
@@ -1773,7 +2005,7 @@ async function refreshStrategyNotesIfNeeded() {
         {
           role: "system",
           content:
-            "You are maintaining concise professional trading notes for an MT5 AI filter. Return JSON only with keys: notes, boost_buckets, avoid_buckets, session_bias, confidence_adjustments. Keep outputs short, risk-aware, and practical.",
+            "You are maintaining concise professional trading notes for an MT5 AI filter. Return JSON only with keys: notes, boost_buckets, avoid_buckets, session_bias, confidence_adjustments. boost_buckets and avoid_buckets must be arrays of objects with bucket, adjustment, risk_multiplier, reason. confidence_adjustments must be an array of objects. Keep outputs short, risk-aware, and practical.",
         },
         {
           role: "user",
@@ -1808,10 +2040,10 @@ async function refreshStrategyNotesIfNeeded() {
         ? result.session_bias
         : {},
     confidence_adjustments:
-      typeof result.confidence_adjustments === "object" &&
+      Array.isArray(result.confidence_adjustments) &&
       result.confidence_adjustments
         ? result.confidence_adjustments
-        : {},
+        : [],
   };
 
   saveStrategyNotes(payload);
