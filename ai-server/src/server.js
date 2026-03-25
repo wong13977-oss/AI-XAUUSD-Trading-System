@@ -85,6 +85,13 @@ function safeNumber(v, fallback = 0) {
   return Number.isFinite(n) ? n : fallback;
 }
 
+function safeRatio(numerator, denominator, fallback = 0) {
+  const n = Number(numerator);
+  const d = Number(denominator);
+  if (!Number.isFinite(n) || !Number.isFinite(d) || d === 0) return fallback;
+  return n / d;
+}
+
 function toEaConfidence(value) {
   let n = Number(value ?? 0);
   if (!Number.isFinite(n)) n = 0;
@@ -151,6 +158,10 @@ function asArray(value) {
   return Array.isArray(value) ? value : [];
 }
 
+function deepEqual(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
 function normalizeSessionBiasValue(value) {
   if (Number.isFinite(Number(value))) {
     return clamp(Number(value), -0.18, 0.18);
@@ -214,6 +225,163 @@ function normalizeBucketRuleEntry(entry, fallbackAdjustment = 0) {
   }
 
   return null;
+}
+
+function normalizeConfidenceAdjustmentRule(rule) {
+  if (!rule || typeof rule !== "object") return null;
+
+  if (rule.type === "stretch_penalty") {
+    return {
+      type: "stretch_penalty",
+      min_stretch_ratio: round2(Math.max(0.4, Number(rule.min_stretch_ratio ?? 0.75))),
+      adjustment: normalizeBucketAdjustmentValue(rule.adjustment, -0.08),
+      risk_multiplier: clamp(Number(rule.risk_multiplier ?? 0.8), 0.25, 1),
+    };
+  }
+
+  if (rule.type === "session_setup_penalty") {
+    return {
+      type: "session_setup_penalty",
+      session: rule.session ? String(rule.session).toUpperCase() : "",
+      setup_tag: rule.setup_tag ? String(rule.setup_tag).toUpperCase() : "",
+      trend_bias: rule.trend_bias ? String(rule.trend_bias).toUpperCase() : "",
+      adjustment: normalizeBucketAdjustmentValue(rule.adjustment, -0.06),
+      risk_multiplier: clamp(Number(rule.risk_multiplier ?? 0.8), 0.25, 1),
+    };
+  }
+
+  if (rule.type === "weak_bucket_penalty") {
+    return {
+      type: "weak_bucket_penalty",
+      min_total: Math.max(0, Number(rule.min_total ?? 3)),
+      max_win_rate: clamp(Number(rule.max_win_rate ?? 0.45), 0, 1),
+      max_avg_rr: Number(rule.max_avg_rr ?? 0),
+      adjustment: normalizeBucketAdjustmentValue(rule.adjustment, -0.08),
+      risk_multiplier: clamp(Number(rule.risk_multiplier ?? 0.5), 0.25, 1),
+    };
+  }
+
+  const text = String(rule.rule || rule.note || rule.reason || "")
+    .trim()
+    .toLowerCase();
+
+  if (!text) return null;
+
+  if (text.includes("newyork") && text.includes("pullback")) {
+    return {
+      type: "session_setup_penalty",
+      session: "NEWYORK",
+      setup_tag: "",
+      trend_bias: "",
+      adjustment: -0.12,
+      risk_multiplier: 0.65,
+    };
+  }
+
+  if (
+    text.includes("ema20") ||
+    text.includes("stretched") ||
+    text.includes("impulse")
+  ) {
+    return {
+      type: "stretch_penalty",
+      min_stretch_ratio: 0.72,
+      adjustment: -0.1,
+      risk_multiplier: 0.72,
+    };
+  }
+
+  if (text.includes("half-size") || text.includes("negative avg_rr")) {
+    return {
+      type: "weak_bucket_penalty",
+      min_total: 3,
+      max_win_rate: 0.45,
+      max_avg_rr: 0,
+      adjustment: -0.08,
+      risk_multiplier: 0.5,
+    };
+  }
+
+  return null;
+}
+
+function normalizeStrategyNotesPayload(notes) {
+  const source = notes && typeof notes === "object" ? notes : {};
+  const confidenceAdjustments = asArray(source.confidence_adjustments)
+    .map((rule) => normalizeConfidenceAdjustmentRule(rule))
+    .filter(Boolean);
+
+  return {
+    updated_at: String(source.updated_at || ""),
+    notes: asArray(source.notes).map((note) => String(note || "")).filter(Boolean),
+    boost_buckets: asArray(source.boost_buckets)
+      .map((entry) => normalizeBucketRuleEntry(entry, 0.04))
+      .filter(Boolean),
+    avoid_buckets: asArray(source.avoid_buckets)
+      .map((entry) => normalizeBucketRuleEntry(entry, -0.08))
+      .filter(Boolean),
+    session_bias:
+      source.session_bias && typeof source.session_bias === "object"
+        ? Object.fromEntries(
+            Object.entries(source.session_bias).map(([key, value]) => [
+              String(key).toUpperCase(),
+              normalizeSessionBiasValue(value),
+            ]),
+          )
+        : {},
+    confidence_adjustments: confidenceAdjustments,
+  };
+}
+
+function normalizeTradeRrResult(trade, pendingMeta = null) {
+  const result = normalizeResultLabel(trade?.result);
+  const raw = safeNumber(trade?.rr_result, 0);
+  let normalized = raw;
+  let repaired = false;
+
+  if (Math.abs(normalized) > 6 && Math.abs(normalized) <= 600) {
+    const scaled = normalized / 100;
+    if (Math.abs(scaled) <= 6) {
+      normalized = scaled;
+      repaired = true;
+    }
+  }
+
+  if (!Number.isFinite(normalized)) {
+    normalized = 0;
+    repaired = true;
+  }
+
+  if (result === "WIN" && normalized < 0) {
+    normalized = Math.abs(normalized);
+    repaired = true;
+  }
+  if (result === "LOSS" && normalized > 0) {
+    normalized = -Math.abs(normalized);
+    repaired = true;
+  }
+  if (result === "BREAKEVEN" && Math.abs(normalized) > 0.25) {
+    normalized = 0;
+    repaired = true;
+  }
+
+  const slPoints = safeNumber(pendingMeta?.sl_points, 0);
+  const tpPoints = safeNumber(pendingMeta?.tp_points, 0);
+  const impliedTargetRr = tpPoints > 0 && slPoints > 0 ? safeRatio(tpPoints, slPoints, 0) : 0;
+  const rrCap = clamp(
+    impliedTargetRr > 0 ? Math.max(2.5, impliedTargetRr * 1.4) : 3,
+    2.5,
+    4,
+  );
+
+  const clipped = clamp(normalized, -2.5, rrCap);
+  if (clipped !== normalized) repaired = true;
+
+  return {
+    raw: round2(raw),
+    normalized: round2(clipped),
+    repaired,
+  };
 }
 
 function computeEntryQualityMetrics(data) {
@@ -531,21 +699,7 @@ function savePending(pending) {
 }
 
 function loadLearning() {
-  return safeReadJson(LEARNING_FILE, {
-    version: 2,
-    created_at: nowIso(),
-    updated_at: nowIso(),
-    global: {
-      total: 0,
-      wins: 0,
-      losses: 0,
-      breakevens: 0,
-      pnl_sum: 0,
-      rr_sum: 0,
-      avg_holding_minutes: 0,
-    },
-    buckets: {},
-  });
+  return safeReadJson(LEARNING_FILE, createEmptyLearningState());
 }
 
 function saveLearning(learning) {
@@ -554,18 +708,31 @@ function saveLearning(learning) {
 }
 
 function loadStrategyNotes() {
+  return normalizeStrategyNotesPayload(
+    safeReadJson(STRATEGY_NOTES_FILE, {
+      updated_at: "",
+      notes: [],
+      boost_buckets: [],
+      avoid_buckets: [],
+      session_bias: {},
+      confidence_adjustments: [],
+    }),
+  );
+}
+
+function loadRawStrategyNotes() {
   return safeReadJson(STRATEGY_NOTES_FILE, {
     updated_at: "",
     notes: [],
     boost_buckets: [],
     avoid_buckets: [],
     session_bias: {},
-    confidence_adjustments: {},
+    confidence_adjustments: [],
   });
 }
 
 function saveStrategyNotes(data) {
-  safeWriteJson(STRATEGY_NOTES_FILE, data);
+  safeWriteJson(STRATEGY_NOTES_FILE, normalizeStrategyNotesPayload(data));
 }
 
 function todayKey() {
@@ -755,6 +922,24 @@ function getBucketStats(bucket) {
   };
 }
 
+function createEmptyLearningState() {
+  return {
+    version: 2,
+    created_at: nowIso(),
+    updated_at: nowIso(),
+    global: {
+      total: 0,
+      wins: 0,
+      losses: 0,
+      breakevens: 0,
+      pnl_sum: 0,
+      rr_sum: 0,
+      avg_holding_minutes: 0,
+    },
+    buckets: {},
+  };
+}
+
 // =========================
 // 学习状态更新
 // =========================
@@ -840,7 +1025,7 @@ function updateLearningFromTrade(trade, pendingMeta) {
 
   const result = normalizeResultLabel(trade.result);
   const pnl = safeNumber(trade.pnl, 0);
-  const rr = safeNumber(trade.rr_result, 0);
+  const rr = normalizeTradeRrResult(trade, pendingMeta).normalized;
   const holdingMinutes = safeNumber(trade.holding_minutes, 0);
 
   updateGlobalStats(learning, result, pnl, rr, holdingMinutes);
@@ -852,6 +1037,88 @@ function updateLearningFromTrade(trade, pendingMeta) {
 
   saveLearning(learning);
   return learning;
+}
+
+function rebuildLearningFromTrades(trades) {
+  const learning = createEmptyLearningState();
+
+  for (const trade of asArray(trades)) {
+    const pendingMeta =
+      trade?.learned_context && typeof trade.learned_context === "object"
+        ? trade.learned_context
+        : null;
+    const result = normalizeResultLabel(trade.result);
+    const pnl = safeNumber(trade.pnl, 0);
+    const rr = normalizeTradeRrResult(trade, pendingMeta).normalized;
+    const holdingMinutes = safeNumber(trade.holding_minutes, 0);
+
+    updateGlobalStats(learning, result, pnl, rr, holdingMinutes);
+
+    if (pendingMeta?.bucket_key) {
+      const bucket = ensureBucket(learning, pendingMeta.bucket_key);
+      updateBucketStats(bucket, pendingMeta, result, pnl, rr, holdingMinutes);
+    }
+  }
+
+  learning.updated_at = nowIso();
+  return learning;
+}
+
+function repairStateFiles() {
+  const storedTrades = loadTrades();
+  const normalizedTrades = asArray(storedTrades).map((trade) => {
+    const pendingMeta =
+      trade?.learned_context && typeof trade.learned_context === "object"
+        ? {
+            ...trade.learned_context,
+            sl_points: safeNumber(trade.learned_context.sl_points, 0),
+            tp_points: safeNumber(trade.learned_context.tp_points, 0),
+            risk_percent: safeNumber(trade.learned_context.risk_percent, 0),
+          }
+        : null;
+    const rrMeta = normalizeTradeRrResult(trade, pendingMeta);
+
+    return {
+      ...trade,
+      learned_context: pendingMeta,
+      rr_result: rrMeta.normalized,
+      rr_result_raw:
+        rrMeta.repaired || trade?.rr_result_raw == null
+          ? rrMeta.raw
+          : safeNumber(trade.rr_result_raw, rrMeta.raw),
+      rr_result_repaired: rrMeta.repaired,
+    };
+  });
+
+  if (!deepEqual(storedTrades, normalizedTrades)) {
+    safeWriteJson(TRADES_FILE, normalizedTrades);
+    console.log("[REPAIR] normalized stored trade outcomes");
+  }
+
+  const rebuiltLearning = rebuildLearningFromTrades(normalizedTrades);
+  const storedLearning = safeReadJson(LEARNING_FILE, createEmptyLearningState());
+  rebuiltLearning.created_at = String(
+    storedLearning.created_at || rebuiltLearning.created_at,
+  );
+  const comparableStoredLearning = {
+    ...storedLearning,
+    updated_at: "",
+  };
+  const comparableRebuiltLearning = {
+    ...rebuiltLearning,
+    updated_at: "",
+  };
+  if (!deepEqual(comparableStoredLearning, comparableRebuiltLearning)) {
+    saveLearning(rebuiltLearning);
+    console.log("[REPAIR] rebuilt learning state from normalized trades");
+  }
+
+  const rawNotes = loadRawStrategyNotes();
+  const normalizedNotes = normalizeStrategyNotesPayload(rawNotes);
+  if (!deepEqual(rawNotes, normalizedNotes)) {
+    saveStrategyNotes(normalizedNotes);
+    console.log("[REPAIR] normalized strategy notes structure");
+  }
 }
 
 // =========================
@@ -914,6 +1181,9 @@ function buildSnapshotForLearning(data, response) {
     action: String(response.action || "SKIP").toUpperCase(),
     confidence: safeNumber(response.confidence, 0),
     confidence_bucket: confidenceBucket(response.confidence),
+    sl_points: safeNumber(response.sl_points, 0),
+    tp_points: safeNumber(response.tp_points, 0),
+    risk_percent: safeNumber(response.risk_percent, 0),
     spread_points: safeNumber(data.spread_points ?? data.spread, 0),
     atr_points: safeNumber(data.atr_points ?? data.atr, 0),
     rsi: safeNumber(data.rsi, 0),
@@ -1068,7 +1338,7 @@ function learningAdjustments(data, baseScore) {
   };
 }
 
-function applyStrategyNotesAdjustment(data, score) {
+function applyStrategyNotesAdjustment(data, score, learn = null) {
   const notes = loadStrategyNotes();
   const bucketKey = buildBucketKey(data);
 
@@ -1134,6 +1404,23 @@ function applyStrategyNotesAdjustment(data, score) {
         note = "SESSION_SETUP_PENALTY";
       }
     }
+
+    if (rule.type === "weak_bucket_penalty") {
+      const stats = learn?.stats || {};
+      const minTotal = Number(rule.min_total ?? 3);
+      const maxWinRate = Number(rule.max_win_rate ?? 0.45);
+      const maxAvgRr = Number(rule.max_avg_rr ?? 0);
+
+      if (
+        safeNumber(stats.total, 0) >= minTotal &&
+        safeNumber(stats.winRate, 0) <= maxWinRate &&
+        safeNumber(stats.avgRR, 0) <= maxAvgRr
+      ) {
+        adj += normalizeBucketAdjustmentValue(rule.adjustment, -0.08);
+        riskMultiplier *= clamp(Number(rule.risk_multiplier ?? 0.5), 0.25, 1);
+        note = "WEAK_BUCKET_PENALTY";
+      }
+    }
   }
 
   return {
@@ -1154,6 +1441,63 @@ function decisionSourceLabel() {
 
 function decisionModelLabel(modelUsed) {
   return hasLiveModelAccess() ? modelUsed : "LOCAL_PRO";
+}
+
+function buildDecisionContext(data, learn, strategy, finalLocalScore) {
+  const quality = computeEntryQualityMetrics(data);
+  const abnormal = detectAbnormalMarket(data);
+  const notes = loadStrategyNotes();
+
+  return {
+    local: {
+      final_score: round2(finalLocalScore),
+      bucket_note: String(learn?.note || "NA"),
+      bucket_stats: {
+        total: safeNumber(learn?.stats?.total, 0),
+        win_rate: round2(safeNumber(learn?.stats?.winRate, 0) * 100),
+        avg_rr: round2(safeNumber(learn?.stats?.avgRR, 0)),
+        avg_pnl: round2(safeNumber(learn?.stats?.avgPnl, 0)),
+      },
+    },
+    quality: {
+      stretch_ratio: round2(quality.stretchRatio),
+      range_ratio: round2(quality.rangeRatio),
+      body_ratio: round2(quality.bodyRatio),
+      body_share: round2(quality.bodyShare),
+      stretched: quality.stretched,
+      climactic: quality.climactic,
+      impulsive: quality.impulsive,
+    },
+    strategy: {
+      adjustment: round2(strategy?.strategyAdj || 0),
+      risk_multiplier: round2(strategy?.riskMultiplier || 1),
+      note: String(strategy?.strategyNote || "NA"),
+      session_bias: notes.session_bias?.[normalizeSession(data.session)] ?? 0,
+      notes_preview: asArray(notes.notes).slice(0, 3),
+    },
+    abnormal_market: abnormal,
+  };
+}
+
+function shouldAllowLocalBypass(data, learn, strategy, finalLocalScore) {
+  const quality = computeEntryQualityMetrics(data);
+  const abnormal = detectAbnormalMarket(data);
+  const stats = learn?.stats || {};
+  const spread = safeNumber(data.spread_points ?? data.spread, 999);
+
+  if (finalLocalScore < 0.92) return false;
+  if (abnormal.abnormal) return false;
+  if (strategy?.strategyAdj < 0) return false;
+  if (safeNumber(stats.total, 0) < 4) return false;
+  if (safeNumber(stats.winRate, 0) < 0.58) return false;
+  if (safeNumber(stats.avgRR, 0) <= 0) return false;
+  if (spread > 25) return false;
+  if (quality.mildlyExtended || quality.stretched) return false;
+  if (quality.impulsive || quality.climactic) return false;
+  if (quality.stretchRatio > 0.45) return false;
+  if (quality.rangeRatio > 1.05) return false;
+
+  return true;
 }
 
 function pickDirectionalAction(data) {
@@ -1396,6 +1740,14 @@ function buildStrategyNotesLocally(trades, buckets, global) {
         adjustment: -0.08,
         risk_multiplier: 0.8,
       },
+      {
+        type: "weak_bucket_penalty",
+        min_total: 3,
+        max_win_rate: 0.45,
+        max_avg_rr: 0,
+        adjustment: -0.08,
+        risk_multiplier: 0.5,
+      },
     ],
   };
 }
@@ -1421,7 +1773,7 @@ function cleanModelJsonText(text) {
   return raw;
 }
 
-async function callModel(modelUsed, data) {
+async function callModel(modelUsed, data, context = {}) {
   if (!hasLiveModelAccess()) {
     return buildProfessionalDecision(data);
   }
@@ -1438,7 +1790,10 @@ async function callModel(modelUsed, data) {
       },
       {
         role: "user",
-        content: JSON.stringify(data),
+        content: JSON.stringify({
+          market_snapshot: data,
+          server_context: context,
+        }),
       },
     ],
   });
@@ -1458,7 +1813,7 @@ async function callModel(modelUsed, data) {
   };
 }
 
-async function callAbnormalReviewModel(modelUsed, data, abnormalInfo) {
+async function callAbnormalReviewModel(modelUsed, data, abnormalInfo, context = {}) {
   if (!hasLiveModelAccess()) {
     return reviewAbnormalMarketLocally(data, abnormalInfo);
   }
@@ -1478,6 +1833,7 @@ async function callAbnormalReviewModel(modelUsed, data, abnormalInfo) {
         content: JSON.stringify({
           data,
           abnormalInfo,
+          context,
         }),
       },
     ],
@@ -1626,8 +1982,14 @@ app.post("/decision", async (req, res) => {
 
   const baseScore = localScore(data);
   const learn = learningAdjustments(data, baseScore);
-  const strategy = applyStrategyNotesAdjustment(data, learn.learnedScore);
+  const strategy = applyStrategyNotesAdjustment(data, learn.learnedScore, learn);
   const finalLocalScore = strategy.scoreAfterStrategy;
+  const decisionContext = buildDecisionContext(
+    data,
+    learn,
+    strategy,
+    finalLocalScore,
+  );
 
   logHeader("NEW DECISION REQUEST");
   console.log("trade_id:", tradeId);
@@ -1704,10 +2066,12 @@ app.post("/decision", async (req, res) => {
   }
 
   // 3) 很高分直接本地放行，不打 API
-  const allowLocalBypass =
-    finalLocalScore >= 0.88 &&
-    (learn.stats.total < 6 ||
-      (learn.stats.winRate >= 0.55 && learn.stats.avgRR > 0));
+  const allowLocalBypass = shouldAllowLocalBypass(
+    data,
+    learn,
+    strategy,
+    finalLocalScore,
+  );
 
   if (allowLocalBypass) {
     const localDecision = buildProfessionalDecision(data);
@@ -1810,7 +2174,7 @@ app.post("/decision", async (req, res) => {
   try {
     const initialCallType = modelUsed === PRIMARY_MODEL ? "primary" : "cheap";
     registerApiCall(initialCallType);
-    const modelResult = await callModel(modelUsed, data);
+    const modelResult = await callModel(modelUsed, data, decisionContext);
 
     let reviewedResult = modelResult;
     let finalRouteTier = routeTier;
@@ -1825,7 +2189,7 @@ app.post("/decision", async (req, res) => {
 
       registerApiCall("primary");
 
-      const primaryResult = await callModel(PRIMARY_MODEL, data);
+      const primaryResult = await callModel(PRIMARY_MODEL, data, decisionContext);
 
       console.log(
         `[PRIMARY] action=${primaryResult.action} conf=${primaryResult.confidence} reason=${primaryResult.reason_code}`,
@@ -1877,6 +2241,7 @@ app.post("/decision", async (req, res) => {
           PRIMARY_MODEL,
           data,
           abnormalInfo,
+          decisionContext,
         );
 
         console.log(
@@ -2005,7 +2370,7 @@ async function refreshStrategyNotesIfNeeded() {
         {
           role: "system",
           content:
-            "You are maintaining concise professional trading notes for an MT5 AI filter. Return JSON only with keys: notes, boost_buckets, avoid_buckets, session_bias, confidence_adjustments. boost_buckets and avoid_buckets must be arrays of objects with bucket, adjustment, risk_multiplier, reason. confidence_adjustments must be an array of objects. Keep outputs short, risk-aware, and practical.",
+            "You are maintaining concise professional trading notes for an MT5 AI filter. Return JSON only with keys: notes, boost_buckets, avoid_buckets, session_bias, confidence_adjustments. boost_buckets and avoid_buckets must be arrays of objects with bucket, adjustment, risk_multiplier, reason. confidence_adjustments must be structured rule objects only. Allowed confidence_adjustments types: stretch_penalty {type,min_stretch_ratio,adjustment,risk_multiplier}, session_setup_penalty {type,session,setup_tag,trend_bias,adjustment,risk_multiplier}, weak_bucket_penalty {type,min_total,max_win_rate,max_avg_rr,adjustment,risk_multiplier}. Keep outputs short, risk-aware, and practical.",
         },
         {
           role: "user",
@@ -2068,16 +2433,24 @@ app.post("/trade-result", async (req, res) => {
   console.log("close_reason:", trade.close_reason);
   console.log("holding_minutes:", trade.holding_minutes);
 
-  saveTrade({
+  const rrMeta = normalizeTradeRrResult(trade, pendingMeta);
+  const normalizedTrade = {
     ...trade,
+    rr_result: rrMeta.normalized,
+    rr_result_raw: rrMeta.raw,
+    rr_result_repaired: rrMeta.repaired,
+  };
+
+  saveTrade({
+    ...normalizedTrade,
     learned_context: pendingMeta || null,
     saved_at: nowIso(),
   });
 
-  const learning = updateLearningFromTrade(trade, pendingMeta);
+  const learning = updateLearningFromTrade(normalizedTrade, pendingMeta);
 
   printLearningSummary({
-    trade,
+    trade: normalizedTrade,
     learning,
     pendingMeta,
   });
@@ -2097,6 +2470,8 @@ app.post("/trade-result", async (req, res) => {
 // =========================
 // 启动
 // =========================
+repairStateFiles();
+
 const server = app.listen(PORT, () => {
   printHealthStartup();
   printStartupSnapshot();
