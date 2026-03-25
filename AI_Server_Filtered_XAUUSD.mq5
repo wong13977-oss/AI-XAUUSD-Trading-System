@@ -10,7 +10,7 @@ CTrade trade;
 input string InpServerUrl                = "http://127.0.0.1:3000/decision";
 input string InpTradeResultUrl           = "http://127.0.0.1:3000/trade-result";
 input string InpHealthUrl                = "http://127.0.0.1:3000/health";
-input string InpApiSecret                = "w0n7n1g6x25i1a63n5qi91m2e7s84s6n3o2m9o1r0e7s6p5e8e1d2y3a4e6f9b0";
+input string InpApiSecret                = "CHANGE_YOURS";
 input string InpSymbol                   = "XAUUSD";
 input ENUM_TIMEFRAMES InpTF              = PERIOD_M15;
 
