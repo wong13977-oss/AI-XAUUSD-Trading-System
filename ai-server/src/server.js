@@ -403,11 +403,47 @@ function computeEntryQualityMetrics(data) {
     rangeRatio,
     bodyRatio,
     bodyShare,
-    farExtended: stretchRatio >= 1.05,
-    stretched: stretchRatio >= 0.82,
+    farExtended: stretchRatio >= 1.1,
+    stretched: stretchRatio >= 0.88,
     mildlyExtended: stretchRatio >= 0.65,
     climactic: rangeRatio >= 1.2 && bodyShare >= 0.72,
     impulsive: rangeRatio >= 0.95 && bodyRatio >= 0.55,
+  };
+}
+
+function isWeakLearningNote(note) {
+  return [
+    "EARLY_WEAK_BUCKET",
+    "WEAK_BUCKET",
+    "BAD_BUCKET",
+    "HARD_BLOCK_BAD_BUCKET",
+  ].includes(String(note || "").toUpperCase());
+}
+
+function isPreferredSession(session) {
+  const normalized = normalizeSession(session);
+  return normalized === "LONDON" || normalized === "NEWYORK";
+}
+
+function buildExecutionScaleMetrics(data, quality = computeEntryQualityMetrics(data)) {
+  const atr = Math.max(quality.atr, 1);
+  const spread = safeNumber(data.spread_points ?? data.spread, 0);
+  const legacyScale = atr < 700;
+  const spreadRatio = safeRatio(spread, atr, 1);
+
+  return {
+    atr,
+    spread,
+    legacyScale,
+    spreadRatio,
+    spreadTight: legacyScale ? spread <= 22 : spreadRatio <= 0.012,
+    spreadOk: legacyScale ? spread <= 35 : spreadRatio <= 0.02,
+    spreadWide: legacyScale ? spread > 45 : spreadRatio > 0.03,
+    spreadTooWide: legacyScale ? spread > 55 : spreadRatio > 0.03 || spread > 55,
+    atrTradable: legacyScale ? atr >= 130 : atr >= 700,
+    atrOptimal: legacyScale
+      ? atr >= 160 && atr <= 420
+      : atr >= 900 && atr <= 2800,
   };
 }
 
@@ -418,6 +454,49 @@ function signed(n) {
 
 function line(char = "-") {
   console.log(char.repeat(70));
+}
+
+function scoreTag(score) {
+  const n = safeNumber(score, 0);
+  if (n >= 0.82) return "A";
+  if (n >= 0.68) return "B";
+  if (n >= 0.54) return "C";
+  return "D";
+}
+
+function buildDecisionReasons(data, learn, strategy, finalLocalScore, response) {
+  const quality = computeEntryQualityMetrics(data);
+  const reasons = [];
+  const session = normalizeSession(data.session);
+  const setup = normalizeSetupTag(data.setup_tag);
+  const trendBias = normalizeTrendBias(data.trend_bias);
+  const spread = safeNumber(data.spread_points ?? data.spread, 0);
+  const atr = Math.max(1, safeNumber(data.atr_points ?? data.atr, 0));
+  const spreadRatio = safeRatio(spread, atr, 0);
+
+  if (["BULL", "BEAR"].includes(trendBias) && setup.includes(trendBias === "BULL" ? "BUY" : "SELL")) {
+    reasons.push(`trend ${trendBias}`);
+  }
+  if (isPreferredSession(session)) reasons.push(`session ${session}`);
+  if (strategy?.strategyAdj > 0) reasons.push(`strategy ${signed(strategy.strategyAdj)}`);
+  if (learn?.scoreAdj > 0) reasons.push(`learning ${signed(learn.scoreAdj)}`);
+  if (spreadRatio > 0 && spreadRatio <= 0.018) reasons.push(`spread ${round2(spreadRatio * 100)}% ATR`);
+  if (quality.stretchRatio >= 0.12 && quality.stretchRatio <= 0.52 && setup.includes("PULLBACK")) {
+    reasons.push(`pullback ${round2(quality.stretchRatio)} ATR`);
+  }
+  if (quality.rangeRatio <= 0.95 && quality.bodyShare >= 0.28 && quality.bodyShare <= 0.68) {
+    reasons.push(`calm bar ${round2(quality.rangeRatio)} ATR`);
+  }
+  if (safeNumber(finalLocalScore, 0) < 0.54) reasons.push("below entry threshold");
+  if (strategy?.strategyAdj < 0) reasons.push(`strategy ${signed(strategy.strategyAdj)}`);
+  if (learn?.scoreAdj < 0) reasons.push(`learning ${signed(learn.scoreAdj)}`);
+  if (quality.stretched || quality.farExtended) reasons.push(`extended ${round2(quality.stretchRatio)} ATR`);
+  if (quality.climactic || quality.rangeRatio > 1.2 || quality.bodyShare > 0.72) {
+    reasons.push(`impulse r=${round2(quality.rangeRatio)} b=${round2(quality.bodyShare)}`);
+  }
+  if (response?.reason_code) reasons.push(`${response.reason_code}`);
+
+  return reasons.slice(0, 5);
 }
 
 function printDecisionSummary({
@@ -437,26 +516,22 @@ function printDecisionSummary({
   const bucketWinRate = stats.winRate || 0;
   const bucketAvgRR = stats.avgRR || 0;
   const bucketAvgPnl = stats.avgPnl || 0;
+  const reasons = buildDecisionReasons(
+    data,
+    learn,
+    strategy,
+    finalLocalScore,
+    response,
+  );
 
   line("=");
-  console.log(
-    `[DECISION] ${String(data.symbol || "").toUpperCase()} ${String(data.timeframe || "").toUpperCase()} | session=${String(data.session || "").toUpperCase()} | trend=${String(data.trend_bias || data.trend || "").toUpperCase()} | setup=${String(data.setup_tag || "").toUpperCase()}`,
-  );
-  console.log(
-    `[LOCAL] base=${round2(baseScore)} adj=${signed(learn?.scoreAdj || 0)} final=${round2(finalLocalScore)} | note=${learn?.note || "NA"}`,
-  );
-  console.log(
-    `[STRATEGY] adj=${signed(strategy?.strategyAdj || 0)} note=${strategy?.strategyNote || "NA"}`,
-  );
-  console.log(
-    `[BUCKET] total=${bucketTotal} win=${pct(bucketWinRate)} rr=${round2(bucketAvgRR)} pnl=${round2(bucketAvgPnl)}`,
-  );
-  console.log(
-    `[ROUTE] route=${routeTier} | api_call=${apiCalled ? "YES" : "NO"} | model=${modelUsed || "LOCAL"}`,
-  );
-  console.log(
-    `[FINAL] action=${response.action} conf=${response.confidence} reason=${response.reason_code} sl=${response.sl_points} tp=${response.tp_points} risk=${response.risk_percent} trade_id=${tradeId}`,
-  );
+  console.log(`📌 Decision | ${String(data.symbol || "").toUpperCase()} ${String(data.timeframe || "").toUpperCase()} | ${String(data.session || "").toUpperCase()} | ${String(data.setup_tag || "").toUpperCase()}`);
+  console.log(`🧭 Context  | trend=${String(data.trend_bias || data.trend || "").toUpperCase()} | trade_id=${tradeId}`);
+  console.log(`📊 Score    | base=${round2(baseScore)} | learn=${signed(learn?.scoreAdj || 0)} | strat=${signed(strategy?.strategyAdj || 0)} | final=${round2(finalLocalScore)} | grade=${scoreTag(finalLocalScore)}`);
+  console.log(`🧠 Learn    | note=${learn?.note || "NA"} | bucket=${bucketTotal} | win=${pct(bucketWinRate)} | rr=${round2(bucketAvgRR)} | pnl=${round2(bucketAvgPnl)}`);
+  console.log(`🛣 Route    | ${routeTier} | api=${apiCalled ? "YES" : "NO"} | model=${modelUsed || "LOCAL"} | strategy=${strategy?.strategyNote || "NA"}`);
+  console.log(`🎯 Final    | action=${response.action} | conf=${response.confidence} | risk=${response.risk_percent}% | sl=${response.sl_points} | tp=${response.tp_points}`);
+  console.log(`📝 Why      | ${reasons.join(" | ")}`);
   line("=");
 }
 
@@ -468,31 +543,23 @@ function printLearningSummary({ trade, learning, pendingMeta }) {
   const avgPnl = total > 0 ? learning.global.pnl_sum / total : 0;
 
   line("=");
-  console.log(
-    `[LEARN] trade_id=${trade.trade_id || "NA"} result=${trade.result || "NA"} pnl=${round2(trade.pnl)} rr=${round2(trade.rr_result)} close=${trade.close_reason || "NA"}`,
-  );
-  console.log(
-    `[GLOBAL] total=${total} win=${pct(winRate)} rr=${round2(avgRR)} pnl=${round2(avgPnl)}`,
-  );
+  console.log(`📚 Result   | trade_id=${trade.trade_id || "NA"} | ${trade.result || "NA"} | pnl=${round2(trade.pnl)} | rr=${round2(trade.rr_result)} | close=${trade.close_reason || "NA"}`);
+  console.log(`🌍 Global   | total=${total} | win=${pct(winRate)} | rr=${round2(avgRR)} | pnl=${round2(avgPnl)}`);
 
   if (pendingMeta?.bucket_key) {
     const bucket = learning.buckets[pendingMeta.bucket_key];
     const bucketStats = getBucketStats(bucket);
 
-    console.log(
-      `[BUCKET] ${pendingMeta.bucket_key} | total=${bucketStats.total} win=${pct(bucketStats.winRate)} rr=${round2(bucketStats.avgRR)} pnl=${round2(bucketStats.avgPnl)}`,
-    );
+    console.log(`🪣 Bucket   | ${pendingMeta.bucket_key} | total=${bucketStats.total} | win=${pct(bucketStats.winRate)} | rr=${round2(bucketStats.avgRR)} | pnl=${round2(bucketStats.avgPnl)}`);
   } else {
-    console.log(`[BUCKET] no pending context matched`);
+    console.log(`🪣 Bucket   | no pending context matched`);
   }
 
   line("=");
 }
 
 function printModelCall(modelUsed, routeTier, tradeId) {
-  console.log(
-    `[MODEL] calling=${modelUsed} | route=${routeTier} | trade_id=${tradeId}`,
-  );
+  console.log(`🤖 Model    | calling=${modelUsed} | route=${routeTier} | trade_id=${tradeId}`);
 }
 
 function printUsageSummary(usage) {
@@ -500,12 +567,8 @@ function printUsageSummary(usage) {
     MONTHLY_BUDGET_USD - safeNumber(usage?.month_estimated_cost_usd, 0),
   );
 
-  console.log(
-    `[USAGE] month_calls=${usage?.month_calls || 0} day_calls=${usage?.day_calls || 0} est_cost_usd=${round2(usage?.month_estimated_cost_usd || 0)} remaining_usd=${remainingBudget}`,
-  );
-  console.log(
-    `[USAGE] cheap=${usage?.cheap_calls || 0} primary=${usage?.primary_calls || 0} summary=${usage?.summary_calls || 0} abnormal=${usage?.abnormal_calls || 0}`,
-  );
+  console.log(`💸 Usage    | month=${usage?.month_calls || 0} | day=${usage?.day_calls || 0} | cost=$${round2(usage?.month_estimated_cost_usd || 0)} | left=$${remainingBudget}`);
+  console.log(`💸 Mix      | cheap=${usage?.cheap_calls || 0} | primary=${usage?.primary_calls || 0} | summary=${usage?.summary_calls || 0} | abnormal=${usage?.abnormal_calls || 0}`);
 }
 
 function printLearningSnapshot(learning) {
@@ -1202,55 +1265,81 @@ function localScore(data) {
   const trend = String(data.trend || "").toLowerCase();
   const trendBias = normalizeTrendBias(data.trend_bias);
   const setup = normalizeSetupTag(data.setup_tag);
+  const session = normalizeSession(data.session);
 
   const rsi = safeNumber(data.rsi, 0);
   const atrPoints = safeNumber(data.atr_points ?? data.atr, 0);
   const spread = safeNumber(data.spread_points ?? data.spread, 999);
   const quality = computeEntryQualityMetrics(data);
+  const execution = buildExecutionScaleMetrics(data, quality);
+  const pullbackWindowOk =
+    quality.stretchRatio >= 0.12 && quality.stretchRatio <= 0.52;
+  const continuationWindowOk = quality.stretchRatio <= 0.32;
+  const candleBalanced =
+    quality.rangeRatio >= 0.18 &&
+    quality.rangeRatio <= 0.95 &&
+    quality.bodyShare >= 0.28 &&
+    quality.bodyShare <= 0.68;
 
   const body1 = safeNumber(data.body1_points, 0);
   const range1 = safeNumber(data.range1_points, 0);
-  const closeToEma20 = safeNumber(data.close_to_ema20_points, 999);
 
   const hasPosition = data.has_position === true;
   const newsBlocked = data.news_blocked === true;
   const dailyLossHit = data.daily_loss_hit === true;
 
-  // 趋势方向
-  if ((trend === "up" || trendBias === "BULL") && rsi >= 50) score += 0.22;
-  if ((trend === "down" || trendBias === "BEAR") && rsi <= 50) score += 0.22;
+  if ((trend === "up" || trendBias === "BULL") && rsi >= 50) score += 0.18;
+  if ((trend === "down" || trendBias === "BEAR") && rsi <= 50) score += 0.18;
 
-  // setup 和方向一致
   if (setup.includes("BUY") && (trend === "up" || trendBias === "BULL"))
-    score += 0.18;
+    score += 0.16;
   if (setup.includes("SELL") && (trend === "down" || trendBias === "BEAR"))
-    score += 0.18;
+    score += 0.16;
 
-  // ATR
-  if (atrPoints >= 130) score += 0.1;
-  if (atrPoints >= 220) score += 0.08;
+  if (isPreferredSession(session)) score += 0.08;
+  else if (session === "ASIA") score -= 0.05;
 
-  // 点差
-  if (spread <= 30) score += 0.15;
-  else if (spread <= 50) score += 0.08;
+  if (execution.spreadTight) score += 0.14;
+  else if (execution.spreadOk) score += 0.09;
+  else if (!execution.spreadWide) score += 0.03;
+  else score -= 0.12;
 
-  // K线质量
-  if (body1 >= 80) score += 0.08;
-  else if (body1 >= 45) score += 0.05;
-  if (range1 >= 140) score += 0.07;
-  else if (range1 >= 90) score += 0.04;
+  if (setup.includes("PULLBACK")) {
+    if (pullbackWindowOk) score += 0.16;
+    else if (quality.stretchRatio <= 0.62) score += 0.08;
+    else score -= 0.1;
+  } else if (setup.includes("CONTINUATION")) {
+    if (continuationWindowOk) score += 0.1;
+    else if (quality.stretchRatio > 0.55) score -= 0.08;
+  }
 
-  // 接近 EMA20 回踩
-  if (closeToEma20 <= 150) score += 0.1;
-  else if (closeToEma20 <= 220) score += 0.05;
+  if (candleBalanced) score += 0.09;
+  else if (quality.rangeRatio > 1.2) score -= 0.14;
+  else if (quality.rangeRatio > 1.05) score -= 0.08;
+  else if (body1 >= 0 && range1 >= 0 && (body1 > 0 || range1 > 0)) score += 0.03;
+  if (quality.bodyShare > 0.72) score -= 0.1;
+  else if (quality.bodyShare > 0.64) score -= 0.05;
+
+  if (execution.atrOptimal) score += 0.05;
 
   if (quality.mildlyExtended) score -= 0.05;
-  if (quality.stretched) score -= 0.11;
+  if (quality.stretched) score -= 0.09;
+  if (quality.farExtended) score -= 0.12;
   if (quality.climactic) score -= 0.14;
   else if (quality.impulsive) score -= 0.07;
-  if (spread > 35) score -= 0.04;
 
-  // 风险抑制
+  if (trendBias === "BULL" && setup.includes("BUY")) {
+    if (rsi >= 52 && rsi <= 64) score += 0.1;
+    else if (rsi > 72) score -= 0.12;
+    else if (rsi < 48) score -= 0.08;
+  }
+
+  if (trendBias === "BEAR" && setup.includes("SELL")) {
+    if (rsi >= 36 && rsi <= 48) score += 0.1;
+    else if (rsi < 28) score -= 0.12;
+    else if (rsi > 52) score -= 0.08;
+  }
+
   if (hasPosition) score -= 0.2;
   if (newsBlocked) score -= 0.4;
   if (dailyLossHit) score -= 0.5;
@@ -1260,16 +1349,15 @@ function localScore(data) {
 
 function detectAbnormalMarket(data) {
   const spread = safeNumber(data.spread_points ?? data.spread, 0);
-  const atr = safeNumber(data.atr_points ?? data.atr, 0);
-  const range1 = safeNumber(data.range1_points, 0);
-  const closeToEma20 = safeNumber(data.close_to_ema20_points, 0);
+  const quality = computeEntryQualityMetrics(data);
+  const execution = buildExecutionScaleMetrics(data, quality);
 
   const reasons = [];
 
-  if (spread > 60) reasons.push("HIGH_SPREAD");
-  if (atr > 600) reasons.push("HIGH_ATR");
-  if (range1 > 420) reasons.push("LARGE_RANGE_BAR");
-  if (closeToEma20 > 340) reasons.push("FAR_FROM_EMA20");
+  if (execution.spreadTooWide) reasons.push("HIGH_SPREAD");
+  if (quality.rangeRatio > 1.35) reasons.push("LARGE_RANGE_BAR");
+  if (quality.stretchRatio > 1.05) reasons.push("FAR_FROM_EMA20");
+  if (quality.climactic) reasons.push("CLIMACTIC_BAR");
 
   return {
     abnormal: reasons.length > 0,
@@ -1290,7 +1378,6 @@ function learningAdjustments(data, baseScore) {
   let skip = false;
   let note = stats.total > 0 ? "EARLY_HISTORY" : "NO_HISTORY";
 
-  // 样本不足，不做激进调整
   if (stats.total < 4) {
     return {
       bucketKey,
@@ -1302,28 +1389,42 @@ function learningAdjustments(data, baseScore) {
     };
   }
 
-  // 正常加减分
-  if (stats.winRate >= 0.62 && stats.avgRR > 0.15) {
+  if (stats.total < 6) {
+    if (stats.winRate <= 0.25 && stats.avgRR < -0.15) {
+      scoreAdj -= 0.04;
+      note = "EARLY_CAUTION_BUCKET";
+    }
+
+    return {
+      bucketKey,
+      stats,
+      scoreAdj,
+      learnedScore: clamp(baseScore + scoreAdj, 0, 1),
+      skip,
+      note,
+    };
+  }
+
+  if (stats.total >= 12 && stats.winRate >= 0.62 && stats.avgRR > 0.18) {
     scoreAdj += 0.1;
     note = "GOOD_BUCKET";
-  } else if (stats.winRate >= 0.55 && stats.avgRR >= 0) {
+  } else if (stats.total >= 8 && stats.winRate >= 0.56 && stats.avgRR >= 0.08) {
     scoreAdj += 0.05;
     note = "DECENT_BUCKET";
-  } else if (stats.total >= 4 && stats.winRate < 0.35 && stats.avgRR < 0) {
-    scoreAdj -= 0.08;
+  } else if (stats.total >= 6 && stats.winRate < 0.34 && stats.avgRR < -0.12) {
+    scoreAdj -= 0.05;
     note = "EARLY_WEAK_BUCKET";
-  } else if (stats.winRate < 0.33 && stats.total >= 10) {
-    scoreAdj -= 0.2;
-    note = "BAD_BUCKET";
-  } else if (stats.winRate < 0.4 && stats.total >= 8) {
-    scoreAdj -= 0.12;
+  } else if (stats.total >= 10 && stats.winRate < 0.36 && stats.avgRR < -0.15) {
+    scoreAdj -= 0.1;
     note = "WEAK_BUCKET";
+  } else if (stats.total >= 14 && stats.winRate < 0.3 && stats.avgRR < -0.2) {
+    scoreAdj -= 0.16;
+    note = "BAD_BUCKET";
   } else {
     note = "NEUTRAL_BUCKET";
   }
 
-  // 极差 bucket：直接拦
-  if (stats.total >= 10 && stats.winRate < 0.28 && stats.avgRR < -0.1) {
+  if (stats.total >= 16 && stats.winRate < 0.28 && stats.avgRR < -0.22) {
     skip = true;
     note = "HARD_BLOCK_BAD_BUCKET";
   }
@@ -1345,6 +1446,7 @@ function applyStrategyNotesAdjustment(data, score, learn = null) {
   let adj = 0;
   let riskMultiplier = 1;
   let note = "NO_STRATEGY_NOTE";
+  const weakHistory = isWeakLearningNote(learn?.note);
 
   const boostRule = asArray(notes.boost_buckets)
     .map((entry) => normalizeBucketRuleEntry(entry, 0.04))
@@ -1361,8 +1463,13 @@ function applyStrategyNotesAdjustment(data, score, learn = null) {
     .find((entry) => entry?.bucket === bucketKey);
 
   if (avoidRule) {
-    adj += avoidRule.adjustment;
-    riskMultiplier *= Math.min(1, avoidRule.risk_multiplier || 0.75);
+    const overlapAdjustment = weakHistory
+      ? Math.max(safeNumber(avoidRule.adjustment, -0.08), -0.04)
+      : safeNumber(avoidRule.adjustment, -0.08);
+    adj += overlapAdjustment;
+    riskMultiplier *= weakHistory
+      ? 0.9
+      : Math.min(1, avoidRule.risk_multiplier || 0.75);
     note = avoidRule.note ? `AVOID_BUCKET:${avoidRule.note}` : "AVOID_BUCKET";
   }
 
@@ -1406,6 +1513,8 @@ function applyStrategyNotesAdjustment(data, score, learn = null) {
     }
 
     if (rule.type === "weak_bucket_penalty") {
+      if (weakHistory) continue;
+
       const stats = learn?.stats || {};
       const minTotal = Number(rule.min_total ?? 3);
       const maxWinRate = Number(rule.max_win_rate ?? 0.45);
@@ -1424,10 +1533,10 @@ function applyStrategyNotesAdjustment(data, score, learn = null) {
   }
 
   return {
-    strategyAdj: adj,
+    strategyAdj: clamp(adj, -0.18, 0.12),
     riskMultiplier: clamp(riskMultiplier, 0.25, 1.2),
     strategyNote: note,
-    scoreAfterStrategy: clamp(score + adj, 0, 1),
+    scoreAfterStrategy: clamp(score + clamp(adj, -0.18, 0.12), 0, 1),
   };
 }
 
@@ -1518,6 +1627,7 @@ function pickDirectionalAction(data) {
 
 function buildProfessionalDecision(data) {
   const actionBias = pickDirectionalAction(data);
+  const session = normalizeSession(data.session);
   const spread = safeNumber(data.spread_points ?? data.spread, 0);
   const atr = safeNumber(data.atr_points ?? data.atr, 0);
   const rsi = safeNumber(data.rsi, 50);
@@ -1530,6 +1640,15 @@ function buildProfessionalDecision(data) {
   const setup = normalizeSetupTag(data.setup_tag);
   const trendBias = normalizeTrendBias(data.trend_bias);
   const quality = computeEntryQualityMetrics(data);
+  const execution = buildExecutionScaleMetrics(data, quality);
+  const pullbackWindowOk =
+    quality.stretchRatio >= 0.12 && quality.stretchRatio <= 0.5;
+  const continuationWindowOk = quality.stretchRatio <= 0.3;
+  const balancedTrendBar =
+    quality.rangeRatio >= 0.2 &&
+    quality.rangeRatio <= 0.95 &&
+    quality.bodyShare >= 0.28 &&
+    quality.bodyShare <= 0.68;
 
   if (hasPosition) {
     return {
@@ -1564,18 +1683,24 @@ function buildProfessionalDecision(data) {
     };
   }
 
-  if (spread > 55) {
+  if (
+    execution.spreadTooWide ||
+    (session === "ASIA" && !execution.legacyScale && execution.spreadRatio > 0.02)
+  ) {
     return {
       action: "SKIP",
       confidence: 34,
-      reason_code: "PRO_SPREAD_TOO_WIDE",
+      reason_code:
+        session === "ASIA" && spread > 35
+          ? "PRO_ASIA_SPREAD_TOO_WIDE"
+          : "PRO_SPREAD_TOO_WIDE",
       sl_points: 0,
       tp_points: 0,
       risk_percent: 0,
     };
   }
 
-  if (atr < 110) {
+  if (!execution.atrTradable) {
     return {
       action: "SKIP",
       confidence: 36,
@@ -1586,7 +1711,7 @@ function buildProfessionalDecision(data) {
     };
   }
 
-  if (quality.climactic || (range1 >= atr * 1.45 && body1 >= range1 * 0.76)) {
+  if (quality.climactic || (range1 >= atr * 1.2 && body1 >= range1 * 0.72)) {
     return {
       action: "SKIP",
       confidence: 44,
@@ -1597,7 +1722,7 @@ function buildProfessionalDecision(data) {
     };
   }
 
-  if (quality.farExtended || closeToEma20 >= atr * 0.9) {
+  if (closeToEma20 >= atr * 1.05 || (quality.farExtended && quality.impulsive)) {
     return {
       action: "SKIP",
       confidence: 46,
@@ -1608,30 +1733,57 @@ function buildProfessionalDecision(data) {
     };
   }
 
-  let confidence = 67;
+  if (session === "ASIA" && !balancedTrendBar) {
+    return {
+      action: "SKIP",
+      confidence: 42,
+      reason_code: "PRO_LOW_LIQUIDITY_SESSION",
+      sl_points: 0,
+      tp_points: 0,
+      risk_percent: 0,
+    };
+  }
 
-  if (setup.includes("PULLBACK")) confidence += 8;
-  if (spread <= 25) confidence += 5;
-  else if (spread <= 40) confidence += 3;
-  if (atr >= 160 && atr <= 420) confidence += 5;
-  if (atr > 420 && atr <= 700) confidence += 3;
-  if (body1 >= 35 && body1 <= atr * 0.5) confidence += 3;
-  if (closeToEma20 <= atr * 0.38) confidence += 5;
-  else if (closeToEma20 <= atr * 0.55) confidence += 2;
+  let confidence = 60;
+
+  if (isPreferredSession(session)) confidence += 5;
+  else if (session === "ASIA") confidence -= 4;
+
+  if (setup.includes("PULLBACK")) {
+    confidence += 6;
+    if (pullbackWindowOk) confidence += 8;
+    else if (quality.stretchRatio > 0.62) confidence -= 10;
+  } else if (setup.includes("CONTINUATION")) {
+    confidence += 4;
+    if (continuationWindowOk) confidence += 5;
+  }
+
+  if (execution.spreadTight) confidence += 7;
+  else if (execution.spreadOk) confidence += 4;
+  else if (execution.spreadWide) confidence -= 8;
+
+  if (balancedTrendBar) confidence += 6;
+  else if (quality.rangeRatio > 1.2) confidence -= 10;
+  else if (quality.rangeRatio > 1.05) confidence -= 6;
+  if (quality.bodyShare > 0.72) confidence -= 8;
+  else if (quality.bodyShare > 0.64) confidence -= 4;
+  if (execution.atrOptimal) confidence += 4;
   if (quality.stretched) confidence -= 10;
   else if (quality.mildlyExtended) confidence -= 4;
+  if (quality.farExtended) confidence -= 8;
+  else if (closeToEma20 >= atr * 0.82) confidence -= 4;
   if (quality.impulsive) confidence -= 6;
 
   if (actionBias === "BUY") {
     if (trendBias === "BULL") confidence += 4;
-    if (rsi >= 51 && rsi <= 67) confidence += 5;
+    if (rsi >= 52 && rsi <= 64) confidence += 6;
     else if (rsi > 75) confidence -= 12;
     else if (rsi < 46) confidence -= 7;
   }
 
   if (actionBias === "SELL") {
     if (trendBias === "BEAR") confidence += 4;
-    if (rsi <= 49 && rsi >= 33) confidence += 5;
+    if (rsi <= 48 && rsi >= 36) confidence += 6;
     else if (rsi < 25) confidence -= 12;
     else if (rsi > 54) confidence -= 7;
   }
@@ -1642,11 +1794,13 @@ function buildProfessionalDecision(data) {
   const rrTarget =
     confidence >= 82 ? 2.1 : confidence >= 76 ? 1.9 : confidence >= 70 ? 1.75 : 1.6;
   const tpPoints = round2(slPoints * rrTarget);
-  const riskPercent = round2(
-    confidence >= 82 ? 0.4 : confidence >= 76 ? 0.32 : 0.24,
-  );
+  let riskPercent =
+    confidence >= 82 ? 0.36 : confidence >= 76 ? 0.3 : 0.22;
+  if (setup.includes("CONTINUATION")) riskPercent *= 0.95;
+  if (session === "ASIA") riskPercent *= 0.9;
+  riskPercent = round2(riskPercent);
 
-  if (confidence < 70) {
+  if (confidence < 66) {
     return {
       action: "SKIP",
       confidence,
@@ -1671,7 +1825,7 @@ function reviewAbnormalMarketLocally(data, abnormalInfo) {
   const spread = safeNumber(data.spread_points ?? data.spread, 0);
   const atr = safeNumber(data.atr_points ?? data.atr, 0);
 
-  if (spread > 65 || abnormalInfo.reasons.length >= 3 || atr > 700) {
+  if (spread > 70 || abnormalInfo.reasons.length >= 4 || atr > 900) {
     return {
       verdict: "ABNORMAL_SKIP",
       confidence: 88,
@@ -1686,25 +1840,88 @@ function reviewAbnormalMarketLocally(data, abnormalInfo) {
   };
 }
 
+function isHardSkipReason(reasonCode) {
+  const reason = String(reasonCode || "").toUpperCase();
+  return [
+    "POSITION_ALREADY_OPEN",
+    "NEWS_RISK_BLOCK",
+    "DAILY_LOSS_BLOCK",
+    "NO_DIRECTIONAL_EDGE",
+    "PRO_SPREAD_TOO_WIDE",
+    "PRO_ASIA_SPREAD_TOO_WIDE",
+    "PRO_RANGE_TOO_SMALL",
+    "PRO_CLIMACTIC_BAR_SKIP",
+    "PRO_CHASE_EXTENSION_SKIP",
+    "ABNORMAL_VOLATILITY_BLOCK",
+    "BAD_HISTORICAL_BUCKET",
+  ].some((token) => reason.includes(token));
+}
+
+function shouldConvertModelSkipToTrade({
+  modelResult,
+  localDecision,
+  data,
+  finalLocalScore,
+}) {
+  if (String(modelResult?.action || "").toUpperCase() !== "SKIP") return false;
+  if (!["BUY", "SELL"].includes(String(localDecision?.action || "").toUpperCase()))
+    return false;
+  if (safeNumber(localDecision?.confidence, 0) < 70) return false;
+  if (isHardSkipReason(modelResult?.reason_code)) return false;
+  if (data.has_position === true || data.news_blocked === true || data.daily_loss_hit === true)
+    return false;
+
+  const spread = safeNumber(data.spread_points ?? data.spread, 999);
+  const atr = safeNumber(data.atr_points ?? data.atr, 0);
+  if (spread > 38 || atr < 100) return false;
+  if (safeNumber(finalLocalScore, 0) < 0.54) return false;
+
+  return true;
+}
+
+function buildConservativeDirectionalFallback(localDecision, finalLocalScore, modelReason) {
+  const confidence = round2(
+    clamp(
+      Math.max(
+        safeNumber(localDecision?.confidence, 0) - 6,
+        safeNumber(finalLocalScore, 0) * 100 - 4,
+      ),
+      64,
+      86,
+    ),
+  );
+
+  return {
+    action: String(localDecision?.action || "SKIP").toUpperCase(),
+    confidence,
+    reason_code: `SMART_FALLBACK_${String(modelReason || localDecision?.reason_code || "DIRECTIONAL").toUpperCase()}`,
+    sl_points: safeNumber(localDecision?.sl_points, 0),
+    tp_points: safeNumber(localDecision?.tp_points, 0),
+    risk_percent: round2(
+      clamp(safeNumber(localDecision?.risk_percent, 0.22) * 0.85, 0.16, 0.3),
+    ),
+  };
+}
+
 function buildStrategyNotesLocally(trades, buckets, global) {
   const boostBuckets = buckets
-    .filter((b) => b.total >= 3 && b.win_rate >= 60 && b.avg_rr > 0)
+    .filter((b) => b.total >= 6 && b.win_rate >= 60 && b.avg_rr > 0.12)
     .slice(0, 5)
     .map((b) => ({
       bucket: b.key,
-      adjustment: b.win_rate >= 70 ? 0.04 : 0.02,
-      risk_multiplier: b.win_rate >= 70 ? 1.05 : 1,
-      reason: "Recent bucket performance is constructive but still risk-aware.",
+      adjustment: b.win_rate >= 68 ? 0.03 : 0.02,
+      risk_multiplier: b.win_rate >= 68 ? 1.04 : 1,
+      reason: "Recent bucket expectancy is constructive and still sample-aware.",
     }));
 
   const avoidBuckets = buckets
-    .filter((b) => b.total >= 3 && b.win_rate <= 40 && b.avg_rr <= 0)
+    .filter((b) => b.total >= 6 && b.win_rate <= 35 && b.avg_rr < -0.12)
     .slice(0, 5)
     .map((b) => ({
       bucket: b.key,
-      adjustment: b.win_rate <= 30 ? -0.12 : -0.08,
-      risk_multiplier: b.win_rate <= 30 ? 0.55 : 0.7,
-      reason: "Recent bucket is underperforming and should be de-risked.",
+      adjustment: b.win_rate <= 25 ? -0.08 : -0.05,
+      risk_multiplier: b.win_rate <= 25 ? 0.75 : 0.85,
+      reason: "Recent bucket is underperforming, so size should be reduced before blocking it.",
     }));
 
   const sessionMap = trades.reduce((acc, trade) => {
@@ -1717,15 +1934,15 @@ function buildStrategyNotesLocally(trades, buckets, global) {
 
   const sessionBias = {};
   for (const [session, stats] of Object.entries(sessionMap)) {
-    if (stats.total < 2) continue;
+    if (stats.total < 4) continue;
     const avgPnl = stats.pnl / stats.total;
-    sessionBias[session] = round2(clamp(avgPnl / 100, -0.05, 0.05));
+    sessionBias[session] = round2(clamp(avgPnl / 250, -0.03, 0.03));
   }
 
   const notes = [
     `Protect capital first: total=${global.total || 0}, wins=${global.wins || 0}, losses=${global.losses || 0}.`,
-    "Prefer trend pullback setups with tight spread and entries closer to EMA20.",
-    "Reduce risk or skip when the market is extended, climactic, or spread widens.",
+    "Prefer London and New York trend-pullback trades only when spread is efficient versus ATR and the pullback stays close to EMA20.",
+    "Treat early losing samples as reduced size, not immediate hard bans; wait for stronger evidence before disabling a bucket.",
   ];
 
   return {
@@ -1736,17 +1953,17 @@ function buildStrategyNotesLocally(trades, buckets, global) {
     confidence_adjustments: [
       {
         type: "stretch_penalty",
-        min_stretch_ratio: 0.75,
-        adjustment: -0.08,
-        risk_multiplier: 0.8,
+        min_stretch_ratio: 0.7,
+        adjustment: -0.06,
+        risk_multiplier: 0.85,
       },
       {
         type: "weak_bucket_penalty",
-        min_total: 3,
-        max_win_rate: 0.45,
-        max_avg_rr: 0,
-        adjustment: -0.08,
-        risk_multiplier: 0.5,
+        min_total: 8,
+        max_win_rate: 0.36,
+        max_avg_rr: -0.1,
+        adjustment: -0.05,
+        risk_multiplier: 0.82,
       },
     ],
   };
@@ -1786,7 +2003,7 @@ async function callModel(modelUsed, data, context = {}) {
       {
         role: "system",
         content:
-          "You are a disciplined professional intraday trader for an MT5 EA. Use only trend-following pullback logic, protect capital first, and avoid emotional or overextended entries. Prefer BUY only when bullish trend bias and setup align; prefer SELL only when bearish trend bias and setup align. Skip when spread is wide, ATR is too low, the move is already extended away from EMA20, a candle looks climactic, or the edge is unclear. Keep risk_percent conservative between 0.25 and 0.5 for valid trades and 0 for skips. Maintain a minimum target reward-to-risk of 1.6, prefer 1.8-2.2 when quality is better. Return JSON only with keys: action, confidence, reason_code, sl_points, tp_points, risk_percent. action must be BUY, SELL, or SKIP. confidence must be 0-100. Do not add explanation outside JSON.",
+          "You are a disciplined professional intraday trader for an MT5 EA. Your job is to decide when an entry should be taken, not to over-filter every setup. Use trend-following pullback logic and calm continuation logic, protect capital first, and avoid emotional or overextended entries. Prefer BUY only when bullish trend bias and setup align; prefer SELL only when bearish trend bias and setup align. Use SKIP only for clear hard blocks such as very wide spread, very low ATR, no directional edge, open position, daily loss lock, or truly abnormal volatility. If the local context already shows a credible trend setup, prefer a lower-confidence BUY or SELL over SKIP unless a hard block exists. Do not skip merely because ATR is elevated or price is somewhat away from EMA20 if the trend structure is still intact; instead lower confidence and risk. Be extra selective in Asia session unless spread is tight and trend structure is clean. Keep risk_percent conservative between 0.18 and 0.4 for valid trades and 0 for skips. Maintain a minimum target reward-to-risk of 1.6, prefer 1.8-2.2 when quality is better. Return JSON only with keys: action, confidence, reason_code, sl_points, tp_points, risk_percent. action must be BUY, SELL, or SKIP. confidence must be 0-100. Do not add explanation outside JSON.",
       },
       {
         role: "user",
@@ -1894,15 +2111,15 @@ function buildRiskPlan(data, learn, strategy, reviewedResult) {
     riskMultiplier *= 0.9;
   }
   if (quality.stretched) {
-    confidencePenalty += 9;
-    riskMultiplier *= 0.75;
+    confidencePenalty += 7;
+    riskMultiplier *= 0.82;
   }
   if (quality.climactic) {
-    confidencePenalty += 12;
-    riskMultiplier *= 0.65;
+    confidencePenalty += 10;
+    riskMultiplier *= 0.72;
   } else if (quality.impulsive) {
-    confidencePenalty += 6;
-    riskMultiplier *= 0.82;
+    confidencePenalty += 5;
+    riskMultiplier *= 0.86;
   }
 
   if (learn?.stats?.total >= 4 && learn?.stats?.winRate < 0.35 && learn?.stats?.avgRR < 0) {
@@ -1915,7 +2132,7 @@ function buildRiskPlan(data, learn, strategy, reviewedResult) {
   }
 
   const adjustedRisk = round2(
-    clamp(safeNumber(reviewedResult?.risk_percent, 0.28) * riskMultiplier, 0.12, 0.5),
+    clamp(safeNumber(reviewedResult?.risk_percent, 0.26) * riskMultiplier, 0.12, 0.36),
   );
 
   return {
@@ -1965,7 +2182,8 @@ function shouldPrimaryReview({ modelResult, learn }) {
 
   if (conf >= PRIMARY_REVIEW_MIN_CONF && conf <= PRIMARY_REVIEW_MAX_CONF)
     return true;
-  if (total < 5) return true;
+  if (conf >= 82) return false;
+  if (total < 4 && conf < 82) return true;
   if (winRate >= 0.45 && winRate <= 0.55) return true;
   if (note === "NO_HISTORY" || note === "NEUTRAL_BUCKET") return true;
 
@@ -2036,7 +2254,7 @@ app.post("/decision", async (req, res) => {
   }
 
   // 2) 低分直接跳过，不打 API
-  if (finalLocalScore < 0.36) {
+  if (finalLocalScore < 0.32) {
     const response = buildDecisionResponse({
       tradeId,
       routeTier: "LOCAL_FILTER",
@@ -2164,7 +2382,11 @@ app.post("/decision", async (req, res) => {
   const bucketWinRate = learn.stats.winRate || 0;
 
   // 只有接近可交易阈值又不够稳，才上主模型
-  if (finalLocalScore >= 0.69 && (bucketTotal < 5 || bucketWinRate < 0.5)) {
+  if (
+    finalLocalScore >= 0.58 &&
+    finalLocalScore < 0.78 &&
+    (bucketTotal < 5 || bucketWinRate < 0.5)
+  ) {
     modelUsed = PRIMARY_MODEL;
     routeTier = "PRIMARY_MODEL";
   }
@@ -2175,6 +2397,7 @@ app.post("/decision", async (req, res) => {
     const initialCallType = modelUsed === PRIMARY_MODEL ? "primary" : "cheap";
     registerApiCall(initialCallType);
     const modelResult = await callModel(modelUsed, data, decisionContext);
+    const localDecision = buildProfessionalDecision(data);
 
     let reviewedResult = modelResult;
     let finalRouteTier = routeTier;
@@ -2207,6 +2430,23 @@ app.post("/decision", async (req, res) => {
       }
     }
 
+    if (
+      shouldConvertModelSkipToTrade({
+        modelResult: reviewedResult,
+        localDecision,
+        data,
+        finalLocalScore,
+      })
+    ) {
+      reviewedResult = buildConservativeDirectionalFallback(
+        localDecision,
+        finalLocalScore,
+        reviewedResult.reason_code,
+      );
+      finalRouteTier = "SMART_FALLBACK";
+      finalModelUsed = "LOCAL";
+    }
+
     const riskPlan = buildRiskPlan(data, learn, strategy, reviewedResult);
     let adjustedConfidence = clamp(
       safeNumber(reviewedResult.confidence, 0) +
@@ -2218,7 +2458,7 @@ app.post("/decision", async (req, res) => {
     );
 
     let finalAction = reviewedResult.action;
-    if (adjustedConfidence < 68) {
+    if (adjustedConfidence < 66) {
       finalAction = "SKIP";
     }
 
@@ -2256,7 +2496,7 @@ app.post("/decision", async (req, res) => {
         } else if (abnormalReview.verdict === "ABNORMAL_REDUCE_RISK") {
           reviewedResult.risk_percent = Math.max(
             0.1,
-            safeNumber(reviewedResult.risk_percent, 0.35) * 0.5,
+            safeNumber(reviewedResult.risk_percent, 0.32) * 0.65,
           );
           finalRouteTier = "ABNORMAL_REDUCE_RISK";
           finalModelUsed = PRIMARY_MODEL;
@@ -2266,10 +2506,10 @@ app.post("/decision", async (req, res) => {
 
     // 历史差 setup 即使模型给了 BUY/SELL，也压低
     if (learn.stats.total >= 10 && learn.stats.winRate < 0.35) {
-      adjustedConfidence = Math.min(adjustedConfidence, 67);
+      adjustedConfidence = Math.min(adjustedConfidence, 65);
     }
 
-    if (adjustedConfidence < 68) {
+    if (adjustedConfidence < 66) {
       finalAction = "SKIP";
     }
 

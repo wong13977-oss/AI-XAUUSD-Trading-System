@@ -173,18 +173,42 @@ function detectTrendBias(bar) {
   return "NEUTRAL";
 }
 
-function detectPullbackSetup(bar, bias) {
+function detectSetup(bar, bias) {
   const tolerance = bar.atr_points * pointSize * 0.18;
+  const continuationMaxStretch = bar.atr_points * 0.58;
+  const continuationMinBody = bar.atr_points * 0.16;
+  const continuationMaxBody = bar.atr_points * 0.62;
+  const continuationMaxRange = bar.atr_points * 1.0;
 
   if (bias === "BULL") {
     if (bar.low <= bar.ema_fast + tolerance || bar.low <= bar.ema20 + tolerance) {
       return "TREND_PULLBACK_BUY";
+    }
+    if (
+      bar.close > bar.ema_fast &&
+      bar.close > bar.ema20 &&
+      bar.close_to_ema20_points <= continuationMaxStretch &&
+      bar.body1_points >= continuationMinBody &&
+      bar.body1_points <= continuationMaxBody &&
+      bar.range1_points <= continuationMaxRange
+    ) {
+      return "TREND_CONTINUATION_BUY";
     }
   }
 
   if (bias === "BEAR") {
     if (bar.high >= bar.ema_fast - tolerance || bar.high >= bar.ema20 - tolerance) {
       return "TREND_PULLBACK_SELL";
+    }
+    if (
+      bar.close < bar.ema_fast &&
+      bar.close < bar.ema20 &&
+      bar.close_to_ema20_points <= continuationMaxStretch &&
+      bar.body1_points >= continuationMinBody &&
+      bar.body1_points <= continuationMaxBody &&
+      bar.range1_points <= continuationMaxRange
+    ) {
+      return "TREND_CONTINUATION_SELL";
     }
   }
 
@@ -378,7 +402,7 @@ async function main() {
       if (openTrade) continue;
 
       const bias = detectTrendBias(bar);
-      const setupTag = detectPullbackSetup(bar, bias);
+      const setupTag = detectSetup(bar, bias);
       const candidate = bias !== "NEUTRAL" && setupTag !== "NONE";
       if (!candidate) continue;
 
