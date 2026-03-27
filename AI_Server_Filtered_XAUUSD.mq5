@@ -31,23 +31,26 @@ input int    InpRSIPeriod                = 14;
 input int    InpATRPeriod                = 14;
 
 input int    InpMaxSpreadPoints          = 35;
-input int    InpMinATRPoints             = 100;
-input int    InpMinConfidence            = 66;
-input double InpMaxEntryStretchATR       = 0.88;
+input int    InpMinATRPoints             = 90;
+input int    InpMinConfidence            = 63;
+input double InpMaxEntryStretchATR       = 0.96;
 input double InpMaxImpulseRangeATR       = 1.20;
 input double InpMaxImpulseBodyShare      = 0.78;
-input double InpMaxSpreadToATRRatio      = 0.022;
+input double InpMaxSpreadToATRRatio      = 0.026;
 input double InpMinPullbackStretchATR    = 0.18;
-input double InpMaxPullbackStretchATR    = 1.20;
-input double InpMaxPullbackRangeATR      = 1.10;
-input double InpMaxPullbackBodyShare     = 0.72;
-input double InpMinContinuationBodyATR   = 0.14;
-input double InpMaxContinuationStretchATR= 0.35;
-input double InpMaxContinuationRangeATR  = 0.90;
+input double InpMaxPullbackStretchATR    = 1.32;
+input double InpMaxPullbackRangeATR      = 1.20;
+input double InpMaxPullbackBodyShare     = 0.78;
+input double InpMinContinuationBodyATR   = 0.12;
+input double InpMaxContinuationStretchATR= 0.42;
+input double InpMaxContinuationRangeATR  = 1.00;
 input double InpMaxContinuationBodyATR   = 0.55;
-input bool   InpBlockNYBullPullback      = true;
+input bool   InpBlockNYBullPullback      = false;
 input int    InpCooldownBars             = 0;
 input bool   InpOnePositionOnly          = true;
+input bool   InpAllowStrongSignalScaleIn = true;
+input int    InpMaxStrongSignalPositions = 3;
+input double InpStrongSignalMinConfidence= 82.0;
 input bool   InpAllowBuy                 = true;
 input bool   InpAllowSell                = true;
 input bool   InpEnablePreFilter          = true;
@@ -363,8 +366,31 @@ bool HasOpenPosition(string symbol)
    return false;
 }
 
+int CountOpenPositions(string symbol, int typeFilter = -1)
+{
+   int count = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+
+      if(PositionGetString(POSITION_SYMBOL) != symbol ||
+         PositionGetInteger(POSITION_MAGIC) != InpMagic)
+         continue;
+
+      int posType = (int)PositionGetInteger(POSITION_TYPE);
+      if(typeFilter >= 0 && posType != typeFilter)
+         continue;
+
+      count++;
+   }
+   return count;
+}
+
 int GetPositionType(string symbol)
 {
+   int foundType = -1;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
@@ -373,9 +399,58 @@ int GetPositionType(string symbol)
 
       if(PositionGetString(POSITION_SYMBOL) == symbol &&
          PositionGetInteger(POSITION_MAGIC) == InpMagic)
-         return (int)PositionGetInteger(POSITION_TYPE);
+      {
+         int posType = (int)PositionGetInteger(POSITION_TYPE);
+         if(foundType == -1)
+            foundType = posType;
+         else if(foundType != posType)
+            return -2;
+      }
    }
-   return -1;
+   return foundType;
+}
+
+bool CanOpenPosition(string action, double confidence)
+{
+   int totalPositions = CountOpenPositions(InpSymbol);
+   if(totalPositions <= 0)
+      return true;
+
+   int desiredType = -1;
+   if(action == "BUY") desiredType = POSITION_TYPE_BUY;
+   else if(action == "SELL") desiredType = POSITION_TYPE_SELL;
+   if(desiredType < 0)
+      return false;
+
+   int sameDirectionCount = CountOpenPositions(InpSymbol, desiredType);
+   if(sameDirectionCount != totalPositions)
+   {
+      DebugPrint("Skip: opposite position already open");
+      return false;
+   }
+
+   if(!InpOnePositionOnly)
+      return true;
+
+   if(!InpAllowStrongSignalScaleIn)
+   {
+      DebugPrint("Skip: already has position");
+      return false;
+   }
+
+   if(confidence < InpStrongSignalMinConfidence)
+   {
+      DebugPrint("Skip: additional entry needs strong signal");
+      return false;
+   }
+
+   if(totalPositions >= InpMaxStrongSignalPositions)
+   {
+      DebugPrint("Skip: reached max strong signal positions");
+      return false;
+   }
+
+   return true;
 }
 
 bool GetMyPosition(ulong &ticket, long &positionId, int &type, double &openPrice, double &sl, double &tp, double &volume, string &comment)
@@ -819,11 +894,6 @@ bool PreFilterPass(double spread_points, double atr_points, string bias, string 
       DebugPrint("Skip: daily loss limit");
       return false;
    }
-   if(InpOnePositionOnly && HasOpenPosition(InpSymbol))
-   {
-      DebugPrint("Skip: already has position");
-      return false;
-   }
    if(InCooldown())
    {
       DebugPrint("Skip: cooldown");
@@ -1014,9 +1084,11 @@ bool RequestDecision(string &responseText)
 
    bool hasPos = HasOpenPosition(InpSymbol);
    int posType = GetPositionType(InpSymbol);
+   int posCount = CountOpenPositions(InpSymbol);
    string posTypeStr = "";
    if(posType == POSITION_TYPE_BUY) posTypeStr = "BUY";
    if(posType == POSITION_TYPE_SELL) posTypeStr = "SELL";
+   if(posType == -2) posTypeStr = "MIXED";
    
    string payload = StringFormat(
    "{"
@@ -1031,6 +1103,9 @@ bool RequestDecision(string &responseText)
 
    "\"has_position\":%s,"
    "\"position_type\":\"%s\","
+   "\"position_count\":%d,"
+   "\"max_scale_in_positions\":%d,"
+   "\"strong_scale_in_min_confidence\":%.1f,"
 
    "\"ema_fast\":%.2f,"
    "\"ema_slow\":%.2f,"
@@ -1062,6 +1137,9 @@ bool RequestDecision(string &responseText)
 
    (hasPos ? "true" : "false"),
    posTypeStr,
+   posCount,
+   InpMaxStrongSignalPositions,
+   InpStrongSignalMinConfidence,
 
    emaFast,
    emaSlow,
@@ -1092,6 +1170,7 @@ return HttpPostJson(InpServerUrl, payload, responseText);
 bool ExecuteBuy(double sl_points, double tp_points, double risk_percent)
 {
    if(!InpAllowBuy) return false;
+   if(!CanOpenPosition("BUY", g_lastDecisionConfidence)) return false;
 
    double ask   = SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
    double point = SafePoint();
@@ -1121,6 +1200,7 @@ bool ExecuteBuy(double sl_points, double tp_points, double risk_percent)
 bool ExecuteSell(double sl_points, double tp_points, double risk_percent)
 {
    if(!InpAllowSell) return false;
+   if(!CanOpenPosition("SELL", g_lastDecisionConfidence)) return false;
 
    double bid   = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
    double point = SafePoint();

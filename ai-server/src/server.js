@@ -47,8 +47,8 @@ const MONTHLY_BUDGET_USD = Number(process.env.MONTHLY_BUDGET_USD || 30);
 const BASE_MONTHLY_TARGET_USD = Number(process.env.BASE_MONTHLY_TARGET_USD || 20);
 
 const MAX_DAILY_CALLS = Number(process.env.MAX_DAILY_CALLS || 20);
-const PRIMARY_REVIEW_MIN_CONF = 68;
-const PRIMARY_REVIEW_MAX_CONF = 76;
+const PRIMARY_REVIEW_MIN_CONF = 66;
+const PRIMARY_REVIEW_MAX_CONF = 78;
 
 const CHEAP_MODEL = process.env.CHEAP_MODEL || "gpt-5.4-mini";
 const PRIMARY_MODEL = process.env.PRIMARY_MODEL || "gpt-5.4";
@@ -1285,8 +1285,21 @@ function localScore(data) {
   const range1 = safeNumber(data.range1_points, 0);
 
   const hasPosition = data.has_position === true;
+  const positionType = String(data.position_type || "").toUpperCase();
+  const positionCount = safeNumber(data.position_count, hasPosition ? 1 : 0);
+  const maxScaleInPositions = clamp(
+    safeNumber(data.max_scale_in_positions, 3),
+    1,
+    10,
+  );
   const newsBlocked = data.news_blocked === true;
   const dailyLossHit = data.daily_loss_hit === true;
+  const actionBias = pickDirectionalAction(data);
+  const sameDirectionScaleIn =
+    hasPosition &&
+    ["BUY", "SELL"].includes(actionBias) &&
+    positionType === actionBias &&
+    positionCount < maxScaleInPositions;
 
   if ((trend === "up" || trendBias === "BULL") && rsi >= 50) score += 0.18;
   if ((trend === "down" || trendBias === "BEAR") && rsi <= 50) score += 0.18;
@@ -1340,7 +1353,7 @@ function localScore(data) {
     else if (rsi > 52) score -= 0.08;
   }
 
-  if (hasPosition) score -= 0.2;
+  if (hasPosition) score -= sameDirectionScaleIn ? 0.06 : 0.2;
   if (newsBlocked) score -= 0.4;
   if (dailyLossHit) score -= 0.5;
 
@@ -1591,20 +1604,16 @@ function buildDecisionContext(data, learn, strategy, finalLocalScore) {
 function shouldAllowLocalBypass(data, learn, strategy, finalLocalScore) {
   const quality = computeEntryQualityMetrics(data);
   const abnormal = detectAbnormalMarket(data);
-  const stats = learn?.stats || {};
   const spread = safeNumber(data.spread_points ?? data.spread, 999);
 
-  if (finalLocalScore < 0.92) return false;
+  if (finalLocalScore < 0.72) return false;
   if (abnormal.abnormal) return false;
-  if (strategy?.strategyAdj < 0) return false;
-  if (safeNumber(stats.total, 0) < 4) return false;
-  if (safeNumber(stats.winRate, 0) < 0.58) return false;
-  if (safeNumber(stats.avgRR, 0) <= 0) return false;
-  if (spread > 25) return false;
-  if (quality.mildlyExtended || quality.stretched) return false;
-  if (quality.impulsive || quality.climactic) return false;
-  if (quality.stretchRatio > 0.45) return false;
-  if (quality.rangeRatio > 1.05) return false;
+  if (strategy?.strategyAdj < -0.04) return false;
+  if (spread > 30) return false;
+  if (quality.farExtended) return false;
+  if (quality.climactic) return false;
+  if (quality.stretchRatio > 0.62) return false;
+  if (quality.rangeRatio > 1.1) return false;
 
   return true;
 }
@@ -1635,6 +1644,18 @@ function buildProfessionalDecision(data) {
   const range1 = safeNumber(data.range1_points, 0);
   const closeToEma20 = safeNumber(data.close_to_ema20_points, 0);
   const hasPosition = data.has_position === true;
+  const positionType = String(data.position_type || "").toUpperCase();
+  const positionCount = safeNumber(data.position_count, hasPosition ? 1 : 0);
+  const maxScaleInPositions = clamp(
+    safeNumber(data.max_scale_in_positions, 3),
+    1,
+    10,
+  );
+  const strongScaleInMinConfidence = clamp(
+    safeNumber(data.strong_scale_in_min_confidence, 82),
+    60,
+    99,
+  );
   const newsBlocked = data.news_blocked === true;
   const dailyLossHit = data.daily_loss_hit === true;
   const setup = normalizeSetupTag(data.setup_tag);
@@ -1642,15 +1663,21 @@ function buildProfessionalDecision(data) {
   const quality = computeEntryQualityMetrics(data);
   const execution = buildExecutionScaleMetrics(data, quality);
   const pullbackWindowOk =
-    quality.stretchRatio >= 0.12 && quality.stretchRatio <= 0.5;
-  const continuationWindowOk = quality.stretchRatio <= 0.3;
+    quality.stretchRatio >= 0.1 && quality.stretchRatio <= 0.58;
+  const continuationWindowOk = quality.stretchRatio <= 0.36;
   const balancedTrendBar =
     quality.rangeRatio >= 0.2 &&
-    quality.rangeRatio <= 0.95 &&
+    quality.rangeRatio <= 1.02 &&
     quality.bodyShare >= 0.28 &&
-    quality.bodyShare <= 0.68;
+    quality.bodyShare <= 0.72;
 
-  if (hasPosition) {
+  const sameDirectionScaleIn =
+    hasPosition &&
+    ["BUY", "SELL"].includes(actionBias) &&
+    positionType === actionBias &&
+    positionCount < maxScaleInPositions;
+
+  if (hasPosition && !sameDirectionScaleIn) {
     return {
       action: "SKIP",
       confidence: 35,
@@ -1744,7 +1771,7 @@ function buildProfessionalDecision(data) {
     };
   }
 
-  let confidence = 60;
+  let confidence = 62;
 
   if (isPreferredSession(session)) confidence += 5;
   else if (session === "ASIA") confidence -= 4;
@@ -1752,7 +1779,7 @@ function buildProfessionalDecision(data) {
   if (setup.includes("PULLBACK")) {
     confidence += 6;
     if (pullbackWindowOk) confidence += 8;
-    else if (quality.stretchRatio > 0.62) confidence -= 10;
+    else if (quality.stretchRatio > 0.7) confidence -= 8;
   } else if (setup.includes("CONTINUATION")) {
     confidence += 4;
     if (continuationWindowOk) confidence += 5;
@@ -1764,14 +1791,14 @@ function buildProfessionalDecision(data) {
 
   if (balancedTrendBar) confidence += 6;
   else if (quality.rangeRatio > 1.2) confidence -= 10;
-  else if (quality.rangeRatio > 1.05) confidence -= 6;
+  else if (quality.rangeRatio > 1.1) confidence -= 5;
   if (quality.bodyShare > 0.72) confidence -= 8;
   else if (quality.bodyShare > 0.64) confidence -= 4;
   if (execution.atrOptimal) confidence += 4;
-  if (quality.stretched) confidence -= 10;
-  else if (quality.mildlyExtended) confidence -= 4;
-  if (quality.farExtended) confidence -= 8;
-  else if (closeToEma20 >= atr * 0.82) confidence -= 4;
+  if (quality.stretched) confidence -= 8;
+  else if (quality.mildlyExtended) confidence -= 3;
+  if (quality.farExtended) confidence -= 6;
+  else if (closeToEma20 >= atr * 0.88) confidence -= 3;
   if (quality.impulsive) confidence -= 6;
 
   if (actionBias === "BUY") {
@@ -1800,11 +1827,22 @@ function buildProfessionalDecision(data) {
   if (session === "ASIA") riskPercent *= 0.9;
   riskPercent = round2(riskPercent);
 
-  if (confidence < 66) {
+  if (confidence < 63) {
     return {
       action: "SKIP",
       confidence,
       reason_code: "PRO_EDGE_BELOW_THRESHOLD",
+      sl_points: 0,
+      tp_points: 0,
+      risk_percent: 0,
+    };
+  }
+
+  if (sameDirectionScaleIn && confidence < strongScaleInMinConfidence) {
+    return {
+      action: "SKIP",
+      confidence,
+      reason_code: "SCALE_IN_SIGNAL_NOT_STRONG",
       sl_points: 0,
       tp_points: 0,
       risk_percent: 0,
@@ -1866,15 +1904,28 @@ function shouldConvertModelSkipToTrade({
   if (String(modelResult?.action || "").toUpperCase() !== "SKIP") return false;
   if (!["BUY", "SELL"].includes(String(localDecision?.action || "").toUpperCase()))
     return false;
-  if (safeNumber(localDecision?.confidence, 0) < 70) return false;
+  if (safeNumber(localDecision?.confidence, 0) < 68) return false;
   if (isHardSkipReason(modelResult?.reason_code)) return false;
-  if (data.has_position === true || data.news_blocked === true || data.daily_loss_hit === true)
+  const positionType = String(data.position_type || "").toUpperCase();
+  const positionCount = safeNumber(data.position_count, data.has_position === true ? 1 : 0);
+  const maxScaleInPositions = clamp(
+    safeNumber(data.max_scale_in_positions, 3),
+    1,
+    10,
+  );
+  const sameDirectionScaleIn =
+    data.has_position === true &&
+    ["BUY", "SELL"].includes(String(localDecision?.action || "").toUpperCase()) &&
+    positionType === String(localDecision?.action || "").toUpperCase() &&
+    positionCount < maxScaleInPositions;
+
+  if ((!sameDirectionScaleIn && data.has_position === true) || data.news_blocked === true || data.daily_loss_hit === true)
     return false;
 
   const spread = safeNumber(data.spread_points ?? data.spread, 999);
   const atr = safeNumber(data.atr_points ?? data.atr, 0);
-  if (spread > 38 || atr < 100) return false;
-  if (safeNumber(finalLocalScore, 0) < 0.54) return false;
+  if (spread > 40 || atr < 90) return false;
+  if (safeNumber(finalLocalScore, 0) < 0.52) return false;
 
   return true;
 }
@@ -1886,7 +1937,7 @@ function buildConservativeDirectionalFallback(localDecision, finalLocalScore, mo
         safeNumber(localDecision?.confidence, 0) - 6,
         safeNumber(finalLocalScore, 0) * 100 - 4,
       ),
-      64,
+      62,
       86,
     ),
   );
@@ -2003,7 +2054,7 @@ async function callModel(modelUsed, data, context = {}) {
       {
         role: "system",
         content:
-          "You are a disciplined professional intraday trader for an MT5 EA. Your job is to decide when an entry should be taken, not to over-filter every setup. Use trend-following pullback logic and calm continuation logic, protect capital first, and avoid emotional or overextended entries. Prefer BUY only when bullish trend bias and setup align; prefer SELL only when bearish trend bias and setup align. Use SKIP only for clear hard blocks such as very wide spread, very low ATR, no directional edge, open position, daily loss lock, or truly abnormal volatility. If the local context already shows a credible trend setup, prefer a lower-confidence BUY or SELL over SKIP unless a hard block exists. Do not skip merely because ATR is elevated or price is somewhat away from EMA20 if the trend structure is still intact; instead lower confidence and risk. Be extra selective in Asia session unless spread is tight and trend structure is clean. Keep risk_percent conservative between 0.18 and 0.4 for valid trades and 0 for skips. Maintain a minimum target reward-to-risk of 1.6, prefer 1.8-2.2 when quality is better. Return JSON only with keys: action, confidence, reason_code, sl_points, tp_points, risk_percent. action must be BUY, SELL, or SKIP. confidence must be 0-100. Do not add explanation outside JSON.",
+    "You are a disciplined professional intraday trader for an MT5 EA. Your job is to decide when an entry should be taken, not to over-filter every setup. Use trend-following pullback logic and calm continuation logic, protect capital first, and avoid emotional or overextended entries. Prefer BUY only when bullish trend bias and setup align; prefer SELL only when bearish trend bias and setup align. Use SKIP only for clear hard blocks such as very wide spread, very low ATR, no directional edge, daily loss lock, or truly abnormal volatility. Treat an open position as a hard block only when it is opposite direction, mixed exposure, or already at the scale-in cap. If the local context already shows a credible trend setup, prefer a lower-confidence BUY or SELL over SKIP unless a hard block exists. Do not skip merely because ATR is elevated or price is somewhat away from EMA20 if the trend structure is still intact; instead lower confidence and risk. Be extra selective in Asia session unless spread is tight and trend structure is clean. Keep risk_percent conservative between 0.18 and 0.4 for valid trades and 0 for skips. Maintain a minimum target reward-to-risk of 1.6, prefer 1.8-2.2 when quality is better. Return JSON only with keys: action, confidence, reason_code, sl_points, tp_points, risk_percent. action must be BUY, SELL, or SKIP. confidence must be 0-100. Do not add explanation outside JSON.",
       },
       {
         role: "user",
@@ -2107,11 +2158,11 @@ function buildRiskPlan(data, learn, strategy, reviewedResult) {
   );
 
   if (quality.mildlyExtended) {
-    confidencePenalty += 4;
+    confidencePenalty += 3;
     riskMultiplier *= 0.9;
   }
   if (quality.stretched) {
-    confidencePenalty += 7;
+    confidencePenalty += 5;
     riskMultiplier *= 0.82;
   }
   if (quality.climactic) {
@@ -2123,12 +2174,12 @@ function buildRiskPlan(data, learn, strategy, reviewedResult) {
   }
 
   if (learn?.stats?.total >= 4 && learn?.stats?.winRate < 0.35 && learn?.stats?.avgRR < 0) {
-    confidencePenalty += 6;
-    riskMultiplier *= 0.72;
+    confidencePenalty += 4;
+    riskMultiplier *= 0.78;
   }
   if (learn?.stats?.total >= 8 && learn?.stats?.winRate < 0.4 && learn?.stats?.avgRR <= 0) {
-    confidencePenalty += 8;
-    riskMultiplier *= 0.7;
+    confidencePenalty += 6;
+    riskMultiplier *= 0.75;
   }
 
   const adjustedRisk = round2(
@@ -2284,6 +2335,77 @@ app.post("/decision", async (req, res) => {
   }
 
   // 3) 很高分直接本地放行，不打 API
+  const localDecision = buildProfessionalDecision(data);
+  const localRiskPlan = buildRiskPlan(data, learn, strategy, localDecision);
+  const localConfidence = clamp(
+    Math.max(safeNumber(localDecision.confidence, 0), finalLocalScore * 100) -
+      localRiskPlan.confidencePenalty,
+    0,
+    100,
+  );
+
+  if (localDecision.action === "SKIP" && finalLocalScore < 0.58) {
+    const response = buildDecisionResponse({
+      tradeId,
+      routeTier: "LOCAL_DECISION_SKIP",
+      action: "SKIP",
+      confidence: localConfidence,
+      reasonCode: localDecision.reason_code || "LOCAL_SKIP",
+      source: "LOCAL_FILTER",
+      model: "LOCAL",
+    });
+
+    printDecisionSummary({
+      tradeId,
+      data,
+      baseScore,
+      learn,
+      finalLocalScore,
+      routeTier: response.route_tier,
+      apiCalled: false,
+      modelUsed: "LOCAL",
+      response,
+      strategy,
+    });
+    return res.json(response);
+  }
+
+  if (
+    localDecision.action !== "SKIP" &&
+    localConfidence >= 63 &&
+    finalLocalScore >= 0.5 &&
+    !detectAbnormalMarket(data).abnormal
+  ) {
+    const response = buildDecisionResponse({
+      tradeId,
+      routeTier: "LOCAL_DIRECT",
+      action: localDecision.action,
+      confidence: localConfidence,
+      reasonCode: localDecision.reason_code || "LOCAL_DIRECT",
+      slPoints: localDecision.sl_points,
+      tpPoints: localDecision.tp_points,
+      riskPercent: localRiskPlan.riskPercent,
+      source: "LOCAL_DIRECT",
+      model: "LOCAL",
+    });
+
+    savePendingDecision(tradeId, buildSnapshotForLearning(data, response));
+
+    printDecisionSummary({
+      tradeId,
+      data,
+      baseScore,
+      learn,
+      finalLocalScore,
+      routeTier: response.route_tier,
+      apiCalled: false,
+      modelUsed: "LOCAL",
+      response,
+      strategy,
+    });
+    return res.json(response);
+  }
+
   const allowLocalBypass = shouldAllowLocalBypass(
     data,
     learn,
@@ -2292,16 +2414,8 @@ app.post("/decision", async (req, res) => {
   );
 
   if (allowLocalBypass) {
-    const localDecision = buildProfessionalDecision(data);
-    const riskPlan = buildRiskPlan(data, learn, strategy, localDecision);
-    const localConfidence = clamp(
-      Math.max(safeNumber(localDecision.confidence, 0), finalLocalScore * 100) -
-        riskPlan.confidencePenalty,
-      0,
-      100,
-    );
     const localAction =
-      localDecision.action !== "SKIP" && localConfidence >= 72
+      localDecision.action !== "SKIP" && localConfidence >= 69
         ? localDecision.action
         : "SKIP";
 
@@ -2316,7 +2430,7 @@ app.post("/decision", async (req, res) => {
           : localDecision.reason_code || "HIGH_LOCAL_SCORE",
       slPoints: localAction === "SKIP" ? 0 : localDecision.sl_points,
       tpPoints: localAction === "SKIP" ? 0 : localDecision.tp_points,
-      riskPercent: localAction === "SKIP" ? 0 : riskPlan.riskPercent,
+      riskPercent: localAction === "SKIP" ? 0 : localRiskPlan.riskPercent,
       source: "LOCAL_HIGH_CONF",
       model: "LOCAL",
     });
@@ -2397,7 +2511,6 @@ app.post("/decision", async (req, res) => {
     const initialCallType = modelUsed === PRIMARY_MODEL ? "primary" : "cheap";
     registerApiCall(initialCallType);
     const modelResult = await callModel(modelUsed, data, decisionContext);
-    const localDecision = buildProfessionalDecision(data);
 
     let reviewedResult = modelResult;
     let finalRouteTier = routeTier;
@@ -2458,7 +2571,7 @@ app.post("/decision", async (req, res) => {
     );
 
     let finalAction = reviewedResult.action;
-    if (adjustedConfidence < 66) {
+    if (adjustedConfidence < 63) {
       finalAction = "SKIP";
     }
 
@@ -2506,10 +2619,10 @@ app.post("/decision", async (req, res) => {
 
     // 历史差 setup 即使模型给了 BUY/SELL，也压低
     if (learn.stats.total >= 10 && learn.stats.winRate < 0.35) {
-      adjustedConfidence = Math.min(adjustedConfidence, 65);
+      adjustedConfidence = Math.min(adjustedConfidence, 62);
     }
 
-    if (adjustedConfidence < 66) {
+    if (adjustedConfidence < 63) {
       finalAction = "SKIP";
     }
 
