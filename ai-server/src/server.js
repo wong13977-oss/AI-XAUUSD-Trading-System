@@ -52,6 +52,10 @@ const PRIMARY_REVIEW_MAX_CONF = 78;
 
 const CHEAP_MODEL = process.env.CHEAP_MODEL || "gpt-5.4-mini";
 const PRIMARY_MODEL = process.env.PRIMARY_MODEL || "gpt-5.4";
+const MODEL_CALL_TIMEOUT_MS = Number(process.env.MODEL_CALL_TIMEOUT_MS || 30000);
+const MAX_RECENT_ENTRIES = Number(process.env.MAX_RECENT_ENTRIES || 20);
+const ENABLE_AB_TEST = process.env.ENABLE_AB_TEST === "1";
+const LEARNING_STATE_VERSION = 3;
 const ESTIMATED_CHEAP_CALL_USD = Number(
   process.env.ESTIMATED_CHEAP_CALL_USD || 0.03,
 );
@@ -160,6 +164,64 @@ function asArray(value) {
 
 function deepEqual(a, b) {
   return JSON.stringify(a) === JSON.stringify(b);
+}
+
+// Fix #6: 入口处统一规范化 spread_points / atr_points
+function normalizeRequestData(data) {
+  if (data.spread_points == null && data.spread != null) {
+    data.spread_points = safeNumber(data.spread, 999);
+  } else {
+    data.spread_points = safeNumber(data.spread_points, 999);
+  }
+  if (data.atr_points == null && data.atr != null) {
+    data.atr_points = safeNumber(data.atr, 0);
+  } else {
+    data.atr_points = safeNumber(data.atr_points, 0);
+  }
+}
+
+// Fix #3: OpenAI 调用超时包装
+async function withModelTimeout(promise, fallback) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(
+        () => reject(new Error("MODEL_TIMEOUT")),
+        MODEL_CALL_TIMEOUT_MS,
+      ),
+    ),
+  ]).catch((err) => {
+    if (err.message === "MODEL_TIMEOUT") {
+      console.log(
+        `[MODEL][TIMEOUT] exceeded ${MODEL_CALL_TIMEOUT_MS}ms, falling back to local`,
+      );
+      return fallback();
+    }
+    throw err;
+  });
+}
+
+// Fix #7: A/B 测试 variant 分配
+function assignAbVariant(tradeId) {
+  if (!ENABLE_AB_TEST) return null;
+  const code = String(tradeId || "");
+  const hash = code.split("").reduce((acc, c) => acc + c.charCodeAt(0), 0);
+  return hash % 2 === 0 ? "A" : "B";
+}
+
+// Fix #5: 预算告警级别
+function getBudgetWarningLevel(usage) {
+  const dailyPct = safeRatio(usage.day_calls, MAX_DAILY_CALLS, 0);
+  const monthlyPct = safeRatio(
+    usage.month_estimated_cost_usd,
+    MONTHLY_BUDGET_USD,
+    0,
+  );
+  const maxPct = Math.max(dailyPct, monthlyPct);
+  if (maxPct >= 1) return "CRITICAL";
+  if (maxPct >= 0.95) return "WARNING_95";
+  if (maxPct >= 0.8) return "WARNING_80";
+  return "OK";
 }
 
 function normalizeSessionBiasValue(value) {
@@ -762,7 +824,30 @@ function savePending(pending) {
 }
 
 function loadLearning() {
-  return safeReadJson(LEARNING_FILE, createEmptyLearningState());
+  const state = safeReadJson(LEARNING_FILE, createEmptyLearningState());
+
+  // Fix #8: 版本迁移
+  if ((state.version || 0) < LEARNING_STATE_VERSION) {
+    const oldVersion = state.version || 0;
+    console.log(
+      `[LEARNING_MIGRATE] v${oldVersion} → v${LEARNING_STATE_VERSION}`,
+    );
+
+    // v2 → v3: 为每个 bucket 添加 recent_entries 和 ab_variants
+    if (!state.buckets) state.buckets = {};
+    for (const key of Object.keys(state.buckets)) {
+      const b = state.buckets[key];
+      if (!Array.isArray(b.recent_entries)) b.recent_entries = [];
+      if (!b.ab_variants || typeof b.ab_variants !== "object")
+        b.ab_variants = {};
+    }
+
+    state.version = LEARNING_STATE_VERSION;
+    safeWriteJson(LEARNING_FILE, state);
+    console.log(`[LEARNING_MIGRATE] done, saved`);
+  }
+
+  return state;
 }
 
 function saveLearning(learning) {
@@ -817,6 +902,8 @@ function loadUsageState() {
     primary_calls: 0,
     summary_calls: 0,
     abnormal_calls: 0,
+    orphaned_trades: [],
+    budget_alert_logged_day: "",
   });
 
   const currentMonth = monthKey();
@@ -836,6 +923,9 @@ function loadUsageState() {
     data.day_key = currentDay;
     data.day_calls = 0;
   }
+
+  if (!Array.isArray(data.orphaned_trades)) data.orphaned_trades = [];
+  if (data.budget_alert_logged_day == null) data.budget_alert_logged_day = "";
 
   if (!Number.isFinite(Number(data.month_estimated_cost_usd))) {
     data.month_estimated_cost_usd = round2(
@@ -881,7 +971,11 @@ function registerApiCall(type) {
 
 function canUseApiCall(type = "cheap") {
   const usage = loadUsageState();
+
   if (usage.day_calls >= MAX_DAILY_CALLS) {
+    console.log(
+      `[BUDGET_ALERT][CRITICAL] daily limit reached: ${usage.day_calls}/${MAX_DAILY_CALLS} calls today`,
+    );
     return { ok: false, reason: "DAILY_LIMIT_REACHED", usage };
   }
 
@@ -889,6 +983,9 @@ function canUseApiCall(type = "cheap") {
     safeNumber(usage.month_estimated_cost_usd, 0) + estimateCallCostUsd(type);
 
   if (projectedCost > MONTHLY_BUDGET_USD) {
+    console.log(
+      `[BUDGET_ALERT][CRITICAL] monthly budget reached: $${round2(projectedCost)} / $${MONTHLY_BUDGET_USD}`,
+    );
     return {
       ok: false,
       reason: "MONTHLY_BUDGET_REACHED",
@@ -897,11 +994,22 @@ function canUseApiCall(type = "cheap") {
     };
   }
 
+  // Fix #5: 预算警告阈值（80% / 95%），每天只记录一次
+  const warningLevel = getBudgetWarningLevel(usage);
+  if (warningLevel !== "OK" && usage.budget_alert_logged_day !== todayKey()) {
+    console.log(
+      `[BUDGET_ALERT][${warningLevel}] daily=${usage.day_calls}/${MAX_DAILY_CALLS} monthly=$${round2(safeNumber(usage.month_estimated_cost_usd, 0))}/$${MONTHLY_BUDGET_USD}`,
+    );
+    usage.budget_alert_logged_day = todayKey();
+    saveUsageState(usage);
+  }
+
   return {
     ok: true,
     reason: "OK",
     usage,
     projected_cost_usd: round2(projectedCost),
+    warning_level: warningLevel,
   };
 }
 
@@ -955,10 +1063,16 @@ function ensureBucket(learning, key) {
         BUY: { total: 0, wins: 0, losses: 0, breakevens: 0 },
         SELL: { total: 0, wins: 0, losses: 0, breakevens: 0 },
       },
+      recent_entries: [],
+      ab_variants: {},
       last_updated: null,
     };
   }
-  return learning.buckets[key];
+  // 兼容旧 bucket 缺少字段
+  const b = learning.buckets[key];
+  if (!Array.isArray(b.recent_entries)) b.recent_entries = [];
+  if (!b.ab_variants || typeof b.ab_variants !== "object") b.ab_variants = {};
+  return b;
 }
 
 function getBucketStats(bucket) {
@@ -974,20 +1088,47 @@ function getBucketStats(bucket) {
     };
   }
 
+  // Fix #4: 近期加权 — recent_entries >= 5 时用 60% recent + 40% global
+  const recent = asArray(bucket.recent_entries);
+  let winRate, lossRate, breakevenRate, avgRR;
+
+  if (recent.length >= 5) {
+    const recentWins = recent.filter((e) => e.result === "WIN").length;
+    const recentLosses = recent.filter((e) => e.result === "LOSS").length;
+    const recentBE = recent.length - recentWins - recentLosses;
+    const recentRR =
+      recent.reduce((s, e) => s + safeNumber(e.rr, 0), 0) / recent.length;
+    const globalWR = bucket.wins / bucket.total;
+    const globalRR = bucket.rr_sum / bucket.total;
+    winRate = 0.6 * (recentWins / recent.length) + 0.4 * globalWR;
+    lossRate =
+      0.6 * (recentLosses / recent.length) + 0.4 * (bucket.losses / bucket.total);
+    breakevenRate =
+      0.6 * (recentBE / recent.length) +
+      0.4 * (bucket.breakevens / bucket.total);
+    avgRR = 0.6 * recentRR + 0.4 * globalRR;
+  } else {
+    winRate = bucket.wins / bucket.total;
+    lossRate = bucket.losses / bucket.total;
+    breakevenRate = bucket.breakevens / bucket.total;
+    avgRR = bucket.rr_sum / bucket.total;
+  }
+
   return {
     total: bucket.total,
-    winRate: bucket.wins / bucket.total,
-    lossRate: bucket.losses / bucket.total,
-    breakevenRate: bucket.breakevens / bucket.total,
-    avgRR: bucket.rr_sum / bucket.total,
+    winRate,
+    lossRate,
+    breakevenRate,
+    avgRR,
     avgPnl: bucket.pnl_sum / bucket.total,
     avgHoldingMinutes: bucket.avg_holding_minutes || 0,
+    recentCount: recent.length,
   };
 }
 
 function createEmptyLearningState() {
   return {
-    version: 2,
+    version: LEARNING_STATE_VERSION,
     created_at: nowIso(),
     updated_at: nowIso(),
     global: {
@@ -1079,6 +1220,32 @@ function updateBucketStats(
   if (result === "WIN") bucket.actions[action].wins += 1;
   else if (result === "LOSS") bucket.actions[action].losses += 1;
   else bucket.actions[action].breakevens += 1;
+
+  // Fix #4: 维护近期滚动窗口
+  if (!Array.isArray(bucket.recent_entries)) bucket.recent_entries = [];
+  bucket.recent_entries.push({ result, rr, timestamp: nowIso() });
+  if (bucket.recent_entries.length > MAX_RECENT_ENTRIES) {
+    bucket.recent_entries = bucket.recent_entries.slice(-MAX_RECENT_ENTRIES);
+  }
+
+  // Fix #7: A/B variant 追踪
+  if (ENABLE_AB_TEST && pendingMeta.ab_variant) {
+    const v = String(pendingMeta.ab_variant).toUpperCase();
+    if (!bucket.ab_variants[v]) {
+      bucket.ab_variants[v] = {
+        total: 0,
+        wins: 0,
+        losses: 0,
+        breakevens: 0,
+        rr_sum: 0,
+      };
+    }
+    bucket.ab_variants[v].total += 1;
+    bucket.ab_variants[v].rr_sum += rr;
+    if (result === "WIN") bucket.ab_variants[v].wins += 1;
+    else if (result === "LOSS") bucket.ab_variants[v].losses += 1;
+    else bucket.ab_variants[v].breakevens += 1;
+  }
 
   bucket.last_updated = nowIso();
 }
@@ -1247,12 +1414,13 @@ function buildSnapshotForLearning(data, response) {
     sl_points: safeNumber(response.sl_points, 0),
     tp_points: safeNumber(response.tp_points, 0),
     risk_percent: safeNumber(response.risk_percent, 0),
-    spread_points: safeNumber(data.spread_points ?? data.spread, 0),
-    atr_points: safeNumber(data.atr_points ?? data.atr, 0),
+    spread_points: safeNumber(data.spread_points, 0),
+    atr_points: safeNumber(data.atr_points, 0),
     rsi: safeNumber(data.rsi, 0),
     body1_points: safeNumber(data.body1_points, 0),
     range1_points: safeNumber(data.range1_points, 0),
     close_to_ema20_points: safeNumber(data.close_to_ema20_points, 0),
+    ab_variant: assignAbVariant(String(response.trade_id || "")),
   };
 }
 
@@ -1545,11 +1713,18 @@ function applyStrategyNotesAdjustment(data, score, learn = null) {
     }
   }
 
+  // Fix #2: 学习系统已惩罚时，限制策略笔记的追加惩罚，避免双重叠加
+  const alreadyPenalized = isWeakLearningNote(learn?.note);
+  if (alreadyPenalized && adj < -0.06) {
+    adj = -0.06;
+  }
+
+  const clampedAdj = clamp(adj, -0.18, 0.12);
   return {
-    strategyAdj: clamp(adj, -0.18, 0.12),
+    strategyAdj: clampedAdj,
     riskMultiplier: clamp(riskMultiplier, 0.25, 1.2),
     strategyNote: note,
-    scoreAfterStrategy: clamp(score + clamp(adj, -0.18, 0.12), 0, 1),
+    scoreAfterStrategy: clamp(score + clampedAdj, 0, 1),
   };
 }
 
@@ -2046,25 +2221,33 @@ async function callModel(modelUsed, data, context = {}) {
     return buildProfessionalDecision(data);
   }
 
-  const completion = await client.chat.completions.create({
-    model: modelUsed,
-    temperature: 0,
-    response_format: { type: "json_object" },
-    messages: [
-      {
-        role: "system",
-        content:
-    "You are a disciplined professional intraday trader for an MT5 EA. Your job is to decide when an entry should be taken, not to over-filter every setup. Use trend-following pullback logic and calm continuation logic, protect capital first, and avoid emotional or overextended entries. Prefer BUY only when bullish trend bias and setup align; prefer SELL only when bearish trend bias and setup align. Use SKIP only for clear hard blocks such as very wide spread, very low ATR, no directional edge, daily loss lock, or truly abnormal volatility. Treat an open position as a hard block only when it is opposite direction, mixed exposure, or already at the scale-in cap. If the local context already shows a credible trend setup, prefer a lower-confidence BUY or SELL over SKIP unless a hard block exists. Do not skip merely because ATR is elevated or price is somewhat away from EMA20 if the trend structure is still intact; instead lower confidence and risk. Be extra selective in Asia session unless spread is tight and trend structure is clean. Keep risk_percent conservative between 0.18 and 0.4 for valid trades and 0 for skips. Maintain a minimum target reward-to-risk of 1.6, prefer 1.8-2.2 when quality is better. Return JSON only with keys: action, confidence, reason_code, sl_points, tp_points, risk_percent. action must be BUY, SELL, or SKIP. confidence must be 0-100. Do not add explanation outside JSON.",
-      },
-      {
-        role: "user",
-        content: JSON.stringify({
-          market_snapshot: data,
-          server_context: context,
-        }),
-      },
-    ],
-  });
+  // Fix #3: 超时保护，超时返回 null 后回退到本地决策
+  const completion = await withModelTimeout(
+    client.chat.completions.create({
+      model: modelUsed,
+      temperature: 0,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+      "You are a disciplined professional intraday trader for an MT5 EA. Your job is to decide when an entry should be taken, not to over-filter every setup. Use trend-following pullback logic and calm continuation logic, protect capital first, and avoid emotional or overextended entries. Prefer BUY only when bullish trend bias and setup align; prefer SELL only when bearish trend bias and setup align. Use SKIP only for clear hard blocks such as very wide spread, very low ATR, no directional edge, daily loss lock, or truly abnormal volatility. Treat an open position as a hard block only when it is opposite direction, mixed exposure, or already at the scale-in cap. If the local context already shows a credible trend setup, prefer a lower-confidence BUY or SELL over SKIP unless a hard block exists. Do not skip merely because ATR is elevated or price is somewhat away from EMA20 if the trend structure is still intact; instead lower confidence and risk. Be extra selective in Asia session unless spread is tight and trend structure is clean. Keep risk_percent conservative between 0.18 and 0.4 for valid trades and 0 for skips. Maintain a minimum target reward-to-risk of 1.6, prefer 1.8-2.2 when quality is better. Return JSON only with keys: action, confidence, reason_code, sl_points, tp_points, risk_percent. action must be BUY, SELL, or SKIP. confidence must be 0-100. Do not add explanation outside JSON.",
+        },
+        {
+          role: "user",
+          content: JSON.stringify({
+            market_snapshot: data,
+            server_context: context,
+          }),
+        },
+      ],
+    }),
+    () => null,
+  );
+
+  if (!completion) {
+    return { ...buildProfessionalDecision(data), reason_code: "LOCAL_PRO_TIMEOUT_FALLBACK" };
+  }
 
   const text = cleanModelJsonText(
     completion.choices?.[0]?.message?.content || "",
@@ -2086,26 +2269,34 @@ async function callAbnormalReviewModel(modelUsed, data, abnormalInfo, context = 
     return reviewAbnormalMarketLocally(data, abnormalInfo);
   }
 
-  const completion = await client.chat.completions.create({
-    model: modelUsed,
-    temperature: 0,
-    response_format: { type: "json_object" },
-    messages: [
-      {
-        role: "system",
-        content:
-          "You are an abnormal market review filter. Return JSON only with keys: verdict, confidence, reason_code. verdict must be ABNORMAL_SKIP, ABNORMAL_OK, or ABNORMAL_REDUCE_RISK.",
-      },
-      {
-        role: "user",
-        content: JSON.stringify({
-          data,
-          abnormalInfo,
-          context,
-        }),
-      },
-    ],
-  });
+  // Fix #3: 超时保护
+  const completion = await withModelTimeout(
+    client.chat.completions.create({
+      model: modelUsed,
+      temperature: 0,
+      response_format: { type: "json_object" },
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are an abnormal market review filter. Return JSON only with keys: verdict, confidence, reason_code. verdict must be ABNORMAL_SKIP, ABNORMAL_OK, or ABNORMAL_REDUCE_RISK.",
+        },
+        {
+          role: "user",
+          content: JSON.stringify({
+            data,
+            abnormalInfo,
+            context,
+          }),
+        },
+      ],
+    }),
+    () => null,
+  );
+
+  if (!completion) {
+    return reviewAbnormalMarketLocally(data, abnormalInfo);
+  }
 
   const text = cleanModelJsonText(
     completion.choices?.[0]?.message?.content || "",
@@ -2248,6 +2439,8 @@ app.post("/decision", async (req, res) => {
 
   const data = req.body || {};
   const tradeId = makeTradeId();
+  // Fix #6: 入口处统一规范化 spread_points / atr_points
+  normalizeRequestData(data);
 
   const baseScore = localScore(data);
   const learn = learningAdjustments(data, baseScore);
@@ -2786,6 +2979,30 @@ app.post("/trade-result", async (req, res) => {
   console.log("close_reason:", trade.close_reason);
   console.log("holding_minutes:", trade.holding_minutes);
 
+  // Fix #1: 孤儿交易检测
+  if (!pendingMeta) {
+    console.log(
+      `[ORPHAN][ALERT] trade_id=${tradeId} has no pending decision — learning state will NOT be updated for this trade`,
+    );
+    try {
+      const usage = loadUsageState();
+      if (!Array.isArray(usage.orphaned_trades)) usage.orphaned_trades = [];
+      usage.orphaned_trades.push({
+        trade_id: tradeId,
+        result: trade.result,
+        pnl: trade.pnl,
+        detected_at: nowIso(),
+      });
+      // 最多保留最近 100 条孤儿记录
+      if (usage.orphaned_trades.length > 100) {
+        usage.orphaned_trades = usage.orphaned_trades.slice(-100);
+      }
+      saveUsageState(usage);
+    } catch (e) {
+      console.log(`[ORPHAN][SAVE_ERROR] ${e?.message || e}`);
+    }
+  }
+
   const rrMeta = normalizeTradeRrResult(trade, pendingMeta);
   const normalizedTrade = {
     ...trade,
@@ -2876,6 +3093,77 @@ app.get("/startup-status", (req, res) => {
 app.get("/strategy-notes", (req, res) => {
   const notes = loadStrategyNotes();
   res.json(notes);
+});
+
+// Fix #1: 孤儿交易查询端点
+app.get("/orphaned-trades", (req, res) => {
+  const usage = loadUsageState();
+  const orphans = asArray(usage.orphaned_trades);
+  res.json({
+    count: orphans.length,
+    orphaned_trades: orphans,
+    note: "These trades closed without a matching pending decision — learning state was NOT updated for them.",
+  });
+});
+
+// Fix #5: 增强预算状态端点
+app.get("/budget-status", (req, res) => {
+  const usage = loadUsageState();
+  const dailyPct = round2(safeRatio(usage.day_calls, MAX_DAILY_CALLS, 0) * 100);
+  const monthlyPct = round2(
+    safeRatio(usage.month_estimated_cost_usd, MONTHLY_BUDGET_USD, 0) * 100,
+  );
+  res.json({
+    warning_level: getBudgetWarningLevel(usage),
+    daily: {
+      calls_used: usage.day_calls,
+      calls_limit: MAX_DAILY_CALLS,
+      pct_used: dailyPct,
+    },
+    monthly: {
+      cost_usd: round2(usage.month_estimated_cost_usd),
+      budget_usd: MONTHLY_BUDGET_USD,
+      pct_used: monthlyPct,
+      remaining_usd: round2(MONTHLY_BUDGET_USD - safeNumber(usage.month_estimated_cost_usd, 0)),
+    },
+    breakdown: {
+      cheap_calls: usage.cheap_calls,
+      primary_calls: usage.primary_calls,
+      summary_calls: usage.summary_calls,
+      abnormal_calls: usage.abnormal_calls,
+    },
+  });
+});
+
+// Fix #7: A/B 测试状态端点
+app.get("/ab-status", (req, res) => {
+  if (!ENABLE_AB_TEST) {
+    return res.json({ enabled: false, message: "Set ENABLE_AB_TEST=1 to enable A/B tracking." });
+  }
+
+  const learning = loadLearning();
+  const buckets = Object.values(learning.buckets || {});
+
+  const variantStats = { A: { total: 0, wins: 0, rr_sum: 0 }, B: { total: 0, wins: 0, rr_sum: 0 } };
+  for (const b of buckets) {
+    for (const [v, s] of Object.entries(b.ab_variants || {})) {
+      if (!variantStats[v]) variantStats[v] = { total: 0, wins: 0, rr_sum: 0 };
+      variantStats[v].total += s.total || 0;
+      variantStats[v].wins += s.wins || 0;
+      variantStats[v].rr_sum += s.rr_sum || 0;
+    }
+  }
+
+  const summary = {};
+  for (const [v, s] of Object.entries(variantStats)) {
+    summary[v] = {
+      total: s.total,
+      win_rate: s.total > 0 ? round2((s.wins / s.total) * 100) : 0,
+      avg_rr: s.total > 0 ? round2(s.rr_sum / s.total) : 0,
+    };
+  }
+
+  res.json({ enabled: true, ab_test_id: process.env.AB_TEST_ID || "default", summary });
 });
 
 export { app, server };
