@@ -47,8 +47,8 @@ const MONTHLY_BUDGET_USD = Number(process.env.MONTHLY_BUDGET_USD || 30);
 const BASE_MONTHLY_TARGET_USD = Number(process.env.BASE_MONTHLY_TARGET_USD || 20);
 
 const MAX_DAILY_CALLS = Number(process.env.MAX_DAILY_CALLS || 20);
-const PRIMARY_REVIEW_MIN_CONF = 66;
-const PRIMARY_REVIEW_MAX_CONF = 78;
+const PRIMARY_REVIEW_MIN_CONF = 62;
+const PRIMARY_REVIEW_MAX_CONF = 80;
 
 const CHEAP_MODEL = process.env.CHEAP_MODEL || "gpt-5.4-mini";
 const PRIMARY_MODEL = process.env.PRIMARY_MODEL || "gpt-5.4";
@@ -64,6 +64,12 @@ const ESTIMATED_SUMMARY_CALL_USD = Number(
 const ESTIMATED_ABNORMAL_CALL_USD = Number(
   process.env.ESTIMATED_ABNORMAL_CALL_USD || 0.08,
 );
+const TRACKED_SYMBOLS = String(
+  process.env.TRACKED_SYMBOLS || "XAUUSD,EURUSD",
+)
+  .split(",")
+  .map((value) => String(value || "").trim().toUpperCase())
+  .filter(Boolean);
 
 // =========================
 // 基础工具
@@ -425,23 +431,50 @@ function isPreferredSession(session) {
   return normalized === "LONDON" || normalized === "NEWYORK";
 }
 
+function isEURUSDSymbol(symbol) {
+  const normalized = String(symbol || "").trim().toUpperCase();
+  return normalized === "EURUSD" || normalized.includes("EURUSD");
+}
+
 function buildExecutionScaleMetrics(data, quality = computeEntryQualityMetrics(data)) {
   const atr = Math.max(quality.atr, 1);
   const spread = safeNumber(data.spread_points ?? data.spread, 0);
-  const legacyScale = atr < 700;
+  const symbol = String(data.symbol || "").trim().toUpperCase();
+  const eurusdProfile = isEURUSDSymbol(symbol);
+  const legacyScale = eurusdProfile ? true : atr < 700;
   const spreadRatio = safeRatio(spread, atr, 1);
 
   return {
+    symbol,
+    eurusdProfile,
     atr,
     spread,
     legacyScale,
     spreadRatio,
-    spreadTight: legacyScale ? spread <= 22 : spreadRatio <= 0.012,
-    spreadOk: legacyScale ? spread <= 35 : spreadRatio <= 0.02,
-    spreadWide: legacyScale ? spread > 45 : spreadRatio > 0.03,
-    spreadTooWide: legacyScale ? spread > 55 : spreadRatio > 0.03 || spread > 55,
-    atrTradable: legacyScale ? atr >= 130 : atr >= 700,
-    atrOptimal: legacyScale
+    spreadTight: eurusdProfile
+      ? spread <= 10
+      : legacyScale
+        ? spread <= 22
+        : spreadRatio <= 0.012,
+    spreadOk: eurusdProfile
+      ? spread <= 18
+      : legacyScale
+        ? spread <= 35
+        : spreadRatio <= 0.02,
+    spreadWide: eurusdProfile
+      ? spread > 22
+      : legacyScale
+        ? spread > 45
+        : spreadRatio > 0.03,
+    spreadTooWide: eurusdProfile
+      ? spread > 28 || spreadRatio > 0.22
+      : legacyScale
+        ? spread > 55
+        : spreadRatio > 0.03 || spread > 55,
+    atrTradable: eurusdProfile ? atr >= 45 : legacyScale ? atr >= 130 : atr >= 700,
+    atrOptimal: eurusdProfile
+      ? atr >= 60 && atr <= 180
+      : legacyScale
       ? atr >= 160 && atr <= 420
       : atr >= 900 && atr <= 2800,
   };
@@ -606,6 +639,96 @@ function printLearningSnapshot(learning) {
   });
 }
 
+function getTrackedSymbols(learning, pending) {
+  const symbols = new Set(TRACKED_SYMBOLS);
+
+  Object.values(learning?.buckets || {}).forEach((bucket) => {
+    const symbol = String(bucket?.key || "").split("|")[0];
+    if (symbol) symbols.add(symbol.toUpperCase());
+  });
+
+  Object.values(pending || {}).forEach((entry) => {
+    const symbol = String(entry?.symbol || "").trim().toUpperCase();
+    if (symbol) symbols.add(symbol);
+  });
+
+  return Array.from(symbols);
+}
+
+function buildSymbolSnapshots(learning, pending) {
+  const buckets = Object.values(learning?.buckets || {});
+  const trackedSymbols = getTrackedSymbols(learning, pending);
+
+  return trackedSymbols.map((symbol) => {
+    const symbolBuckets = buckets.filter(
+      (bucket) => String(bucket?.key || "").split("|")[0] === symbol,
+    );
+    const totals = symbolBuckets.reduce(
+      (acc, bucket) => {
+        acc.total += safeNumber(bucket.total, 0);
+        acc.wins += safeNumber(bucket.wins, 0);
+        acc.losses += safeNumber(bucket.losses, 0);
+        acc.breakevens += safeNumber(bucket.breakevens, 0);
+        acc.rr_sum += safeNumber(bucket.rr_sum, 0);
+        acc.pnl_sum += safeNumber(bucket.pnl_sum, 0);
+        return acc;
+      },
+      { total: 0, wins: 0, losses: 0, breakevens: 0, rr_sum: 0, pnl_sum: 0 },
+    );
+    const topBucket = symbolBuckets
+      .filter((bucket) => safeNumber(bucket.total, 0) > 0)
+      .sort((a, b) => safeNumber(b.total, 0) - safeNumber(a.total, 0))[0];
+    const pendingCount = Object.values(pending || {}).filter(
+      (entry) => String(entry?.symbol || "").trim().toUpperCase() === symbol,
+    ).length;
+
+    return {
+      symbol,
+      total: totals.total,
+      wins: totals.wins,
+      losses: totals.losses,
+      breakevens: totals.breakevens,
+      win_rate: totals.total > 0 ? round2((totals.wins / totals.total) * 100) : 0,
+      avg_rr: totals.total > 0 ? round2(totals.rr_sum / totals.total) : 0,
+      avg_pnl: totals.total > 0 ? round2(totals.pnl_sum / totals.total) : 0,
+      bucket_count: symbolBuckets.length,
+      pending_count: pendingCount,
+      top_bucket: topBucket
+        ? {
+            key: topBucket.key,
+            total: safeNumber(topBucket.total, 0),
+            win_rate:
+              safeNumber(topBucket.total, 0) > 0
+                ? round2((safeNumber(topBucket.wins, 0) / safeNumber(topBucket.total, 0)) * 100)
+                : 0,
+            avg_rr:
+              safeNumber(topBucket.total, 0) > 0
+                ? round2(safeNumber(topBucket.rr_sum, 0) / safeNumber(topBucket.total, 0))
+                : 0,
+          }
+        : null,
+    };
+  });
+}
+
+function printSymbolSnapshots(learning, pending) {
+  const symbolSnapshots = buildSymbolSnapshots(learning, pending);
+
+  if (symbolSnapshots.length === 0) {
+    console.log("[SYMBOLS] no tracked symbols");
+    return;
+  }
+
+  symbolSnapshots.forEach((snapshot) => {
+    const topBucketText = snapshot.top_bucket
+      ? ` | top=${snapshot.top_bucket.key} | top_win=${snapshot.top_bucket.win_rate}% | top_rr=${snapshot.top_bucket.avg_rr}`
+      : "";
+    console.log(
+      `[SYMBOL] ${snapshot.symbol} | total=${snapshot.total} | win=${snapshot.win_rate}% | rr=${snapshot.avg_rr} | pnl=${snapshot.avg_pnl} | buckets=${snapshot.bucket_count} | pending=${snapshot.pending_count}${topBucketText}`,
+    );
+  });
+}
+
 function printStrategyNotesSnapshot(notes) {
   const noteCount = Array.isArray(notes?.notes) ? notes.notes.length : 0;
   const boostCount = Array.isArray(notes?.boost_buckets)
@@ -707,6 +830,7 @@ function buildStartupSnapshot() {
     pending: {
       open_pending: Object.keys(pending || {}).length,
     },
+    symbols: buildSymbolSnapshots(learning, pending),
     generated_at: nowIso(),
   };
 }
@@ -719,6 +843,7 @@ function printStartupSnapshot() {
   printUsageSummary(snapshot.usage);
   printLearningSnapshot(loadLearning());
   printStrategyNotesSnapshot(loadStrategyNotes());
+  printSymbolSnapshots(loadLearning(), loadPending());
   console.log(`[PENDING] open_pending=${snapshot.pending.open_pending}`);
   line("=");
 }
@@ -737,6 +862,7 @@ function printHealthStartup() {
   console.log(`[START] usage_file=${USAGE_STATE_FILE}`);
   console.log(`[START] max_daily_calls=${MAX_DAILY_CALLS}`);
   console.log(`[START] monthly_budget_usd=${MONTHLY_BUDGET_USD}`);
+  console.log(`[START] tracked_symbols=${TRACKED_SYMBOLS.join(",")}`);
   line("=");
 }
 
@@ -817,6 +943,7 @@ function loadUsageState() {
     primary_calls: 0,
     summary_calls: 0,
     abnormal_calls: 0,
+    last_strategy_refresh_total: 0,
   });
 
   const currentMonth = monthKey();
@@ -1287,8 +1414,16 @@ function localScore(data) {
   const hasPosition = data.has_position === true;
   const positionType = String(data.position_type || "").toUpperCase();
   const positionCount = safeNumber(data.position_count, hasPosition ? 1 : 0);
+  const maxOpenPositionsPerSymbol = clamp(
+    safeNumber(data.max_open_positions_per_symbol, 1),
+    1,
+    10,
+  );
   const maxScaleInPositions = clamp(
-    safeNumber(data.max_scale_in_positions, 3),
+    Math.min(
+      safeNumber(data.max_scale_in_positions, 3),
+      maxOpenPositionsPerSymbol,
+    ),
     1,
     10,
   );
@@ -1299,7 +1434,7 @@ function localScore(data) {
     hasPosition &&
     ["BUY", "SELL"].includes(actionBias) &&
     positionType === actionBias &&
-    positionCount < maxScaleInPositions;
+    positionCount < maxOpenPositionsPerSymbol;
 
   if ((trend === "up" || trendBias === "BULL") && rsi >= 50) score += 0.18;
   if ((trend === "down" || trendBias === "BEAR") && rsi <= 50) score += 0.18;
@@ -1353,7 +1488,7 @@ function localScore(data) {
     else if (rsi > 52) score -= 0.08;
   }
 
-  if (hasPosition) score -= sameDirectionScaleIn ? 0.06 : 0.2;
+  if (hasPosition && !sameDirectionScaleIn) score -= 0.04;
   if (newsBlocked) score -= 0.4;
   if (dailyLossHit) score -= 0.5;
 
@@ -1367,10 +1502,10 @@ function detectAbnormalMarket(data) {
 
   const reasons = [];
 
-  if (execution.spreadTooWide) reasons.push("HIGH_SPREAD");
-  if (quality.rangeRatio > 1.35) reasons.push("LARGE_RANGE_BAR");
-  if (quality.stretchRatio > 1.05) reasons.push("FAR_FROM_EMA20");
-  if (quality.climactic) reasons.push("CLIMACTIC_BAR");
+  if (spread > 80 || execution.spreadTooWide) reasons.push("HIGH_SPREAD");
+  if (quality.rangeRatio > 1.75) reasons.push("LARGE_RANGE_BAR");
+  if (quality.stretchRatio > 1.35) reasons.push("FAR_FROM_EMA20");
+  if (quality.climactic && quality.rangeRatio > 1.4) reasons.push("CLIMACTIC_BAR");
 
   return {
     abnormal: reasons.length > 0,
@@ -1606,16 +1741,59 @@ function shouldAllowLocalBypass(data, learn, strategy, finalLocalScore) {
   const abnormal = detectAbnormalMarket(data);
   const spread = safeNumber(data.spread_points ?? data.spread, 999);
 
-  if (finalLocalScore < 0.72) return false;
+  if (finalLocalScore < 0.42) return false;
   if (abnormal.abnormal) return false;
-  if (strategy?.strategyAdj < -0.04) return false;
-  if (spread > 30) return false;
+  if (strategy?.strategyAdj < -0.14) return false;
+  if (spread > 55) return false;
   if (quality.farExtended) return false;
   if (quality.climactic) return false;
-  if (quality.stretchRatio > 0.62) return false;
-  if (quality.rangeRatio > 1.1) return false;
+  if (quality.stretchRatio > 1.02) return false;
+  if (quality.rangeRatio > 1.45) return false;
 
   return true;
+}
+
+function shouldAllowMomentumFallback({
+  data,
+  localDecision,
+  localConfidence,
+  finalLocalScore,
+}) {
+  const action = String(localDecision?.action || "").toUpperCase();
+  if (!["BUY", "SELL"].includes(action)) return false;
+  if (safeNumber(localConfidence, 0) < 58) return false;
+  if (safeNumber(finalLocalScore, 0) < 0.24) return false;
+
+  const session = normalizeSession(data.session);
+  if (session === "OFF") return false;
+
+  const setup = normalizeSetupTag(data.setup_tag);
+  if (!setup.includes("PULLBACK")) return false;
+
+  const quality = computeEntryQualityMetrics(data);
+  const execution = buildExecutionScaleMetrics(data, quality);
+  const abnormal = detectAbnormalMarket(data);
+
+  if (abnormal.abnormal) return false;
+  if (execution.spreadTooWide) return false;
+  if (quality.rangeRatio > 1.45) return false;
+  if (quality.bodyShare > 0.88) return false;
+  if (quality.stretchRatio < 0.28 || quality.stretchRatio > 1.2) return false;
+
+  return true;
+}
+
+function buildMomentumFallback(localDecision, localRiskPlan) {
+  return {
+    action: String(localDecision.action || "SKIP").toUpperCase(),
+    confidence: clamp(safeNumber(localDecision.confidence, 0) - 2, 68, 90),
+    reason_code: `MOMENTUM_FALLBACK_${String(localDecision.reason_code || "LOCAL").toUpperCase()}`,
+    sl_points: safeNumber(localDecision.sl_points, 0),
+    tp_points: safeNumber(localDecision.tp_points, 0),
+    risk_percent: round2(
+      clamp(safeNumber(localRiskPlan?.riskPercent, 0.24) * 0.9, 0.16, 0.32),
+    ),
+  };
 }
 
 function pickDirectionalAction(data) {
@@ -1646,14 +1824,22 @@ function buildProfessionalDecision(data) {
   const hasPosition = data.has_position === true;
   const positionType = String(data.position_type || "").toUpperCase();
   const positionCount = safeNumber(data.position_count, hasPosition ? 1 : 0);
+  const maxOpenPositionsPerSymbol = clamp(
+    safeNumber(data.max_open_positions_per_symbol, 1),
+    1,
+    10,
+  );
   const maxScaleInPositions = clamp(
-    safeNumber(data.max_scale_in_positions, 3),
+    Math.min(
+      safeNumber(data.max_scale_in_positions, 3),
+      maxOpenPositionsPerSymbol,
+    ),
     1,
     10,
   );
   const strongScaleInMinConfidence = clamp(
-    safeNumber(data.strong_scale_in_min_confidence, 82),
-    60,
+    safeNumber(data.strong_scale_in_min_confidence, 56),
+    52,
     99,
   );
   const newsBlocked = data.news_blocked === true;
@@ -1675,13 +1861,13 @@ function buildProfessionalDecision(data) {
     hasPosition &&
     ["BUY", "SELL"].includes(actionBias) &&
     positionType === actionBias &&
-    positionCount < maxScaleInPositions;
+    positionCount < maxOpenPositionsPerSymbol;
 
-  if (hasPosition && !sameDirectionScaleIn) {
+  if (hasPosition && !sameDirectionScaleIn && positionCount >= maxOpenPositionsPerSymbol) {
     return {
       action: "SKIP",
-      confidence: 35,
-      reason_code: "POSITION_ALREADY_OPEN",
+      confidence: 38,
+      reason_code: "MAX_SYMBOL_POSITIONS_REACHED",
       sl_points: 0,
       tp_points: 0,
       risk_percent: 0,
@@ -1771,7 +1957,7 @@ function buildProfessionalDecision(data) {
     };
   }
 
-  let confidence = 62;
+  let confidence = 60;
 
   if (isPreferredSession(session)) confidence += 5;
   else if (session === "ASIA") confidence -= 4;
@@ -1815,9 +2001,9 @@ function buildProfessionalDecision(data) {
     else if (rsi > 54) confidence -= 7;
   }
 
-  confidence = clamp(confidence, 48, 95);
+  confidence = clamp(confidence, 44, 95);
 
-  const slPoints = round2(clamp(atr * 0.92, 130, 950));
+  const slPoints = round2(clamp(atr * 0.92, atr * 0.80, atr * 1.15));
   const rrTarget =
     confidence >= 82 ? 2.1 : confidence >= 76 ? 1.9 : confidence >= 70 ? 1.75 : 1.6;
   const tpPoints = round2(slPoints * rrTarget);
@@ -1827,7 +2013,7 @@ function buildProfessionalDecision(data) {
   if (session === "ASIA") riskPercent *= 0.9;
   riskPercent = round2(riskPercent);
 
-  if (confidence < 63) {
+  if (confidence < 56) {
     return {
       action: "SKIP",
       confidence,
@@ -2041,6 +2227,16 @@ function cleanModelJsonText(text) {
   return raw;
 }
 
+async function callModelWithRetry(modelUsed, data, context = {}) {
+  try {
+    return await callModel(modelUsed, data, context);
+  } catch (err) {
+    console.log("[RETRY] Model call failed, retrying once:", err?.message || err);
+    await new Promise((r) => setTimeout(r, 500));
+    return await callModel(modelUsed, data, context);
+  }
+}
+
 async function callModel(modelUsed, data, context = {}) {
   if (!hasLiveModelAccess()) {
     return buildProfessionalDecision(data);
@@ -2158,32 +2354,32 @@ function buildRiskPlan(data, learn, strategy, reviewedResult) {
   );
 
   if (quality.mildlyExtended) {
+    confidencePenalty += 2;
+    riskMultiplier *= 0.94;
+  }
+  if (quality.stretched) {
+    confidencePenalty += 3;
+    riskMultiplier *= 0.88;
+  }
+  if (quality.climactic) {
+    confidencePenalty += 6;
+    riskMultiplier *= 0.82;
+  } else if (quality.impulsive) {
     confidencePenalty += 3;
     riskMultiplier *= 0.9;
   }
-  if (quality.stretched) {
-    confidencePenalty += 5;
-    riskMultiplier *= 0.82;
-  }
-  if (quality.climactic) {
-    confidencePenalty += 10;
-    riskMultiplier *= 0.72;
-  } else if (quality.impulsive) {
-    confidencePenalty += 5;
-    riskMultiplier *= 0.86;
-  }
 
   if (learn?.stats?.total >= 4 && learn?.stats?.winRate < 0.35 && learn?.stats?.avgRR < 0) {
-    confidencePenalty += 4;
-    riskMultiplier *= 0.78;
+    confidencePenalty += 2;
+    riskMultiplier *= 0.88;
   }
   if (learn?.stats?.total >= 8 && learn?.stats?.winRate < 0.4 && learn?.stats?.avgRR <= 0) {
-    confidencePenalty += 6;
-    riskMultiplier *= 0.75;
+    confidencePenalty += 3;
+    riskMultiplier *= 0.84;
   }
 
   const adjustedRisk = round2(
-    clamp(safeNumber(reviewedResult?.risk_percent, 0.26) * riskMultiplier, 0.12, 0.36),
+    clamp(safeNumber(reviewedResult?.risk_percent, 0.28) * riskMultiplier, 0.14, 0.4),
   );
 
   return {
@@ -2236,7 +2432,7 @@ function shouldPrimaryReview({ modelResult, learn }) {
   if (conf >= 82) return false;
   if (total < 4 && conf < 82) return true;
   if (winRate >= 0.45 && winRate <= 0.55) return true;
-  if (note === "NO_HISTORY" || note === "NEUTRAL_BUCKET") return true;
+  if ((note === "NO_HISTORY" || note === "NEUTRAL_BUCKET") && conf < 85) return true;
 
   return false;
 }
@@ -2305,7 +2501,7 @@ app.post("/decision", async (req, res) => {
   }
 
   // 2) 低分直接跳过，不打 API
-  if (finalLocalScore < 0.32) {
+  if (finalLocalScore < 0.1) {
     const response = buildDecisionResponse({
       tradeId,
       routeTier: "LOCAL_FILTER",
@@ -2337,14 +2533,57 @@ app.post("/decision", async (req, res) => {
   // 3) 很高分直接本地放行，不打 API
   const localDecision = buildProfessionalDecision(data);
   const localRiskPlan = buildRiskPlan(data, learn, strategy, localDecision);
-  const localConfidence = clamp(
-    Math.max(safeNumber(localDecision.confidence, 0), finalLocalScore * 100) -
-      localRiskPlan.confidencePenalty,
-    0,
-    100,
-  );
+  const localDecisionConfidence = safeNumber(localDecision.confidence, 0);
+  const localConfidence =
+    localDecision.action === "SKIP"
+      ? clamp(localDecisionConfidence, 0, 100)
+      : clamp(
+          Math.max(localDecisionConfidence, finalLocalScore * 100) -
+            localRiskPlan.confidencePenalty,
+          0,
+          100,
+        );
 
-  if (localDecision.action === "SKIP" && finalLocalScore < 0.58) {
+  if (
+    shouldAllowMomentumFallback({
+      data,
+      localDecision,
+      localConfidence,
+      finalLocalScore,
+    })
+  ) {
+    const fallback = buildMomentumFallback(localDecision, localRiskPlan);
+    const response = buildDecisionResponse({
+      tradeId,
+      routeTier: "LOCAL_MOMENTUM_FALLBACK",
+      action: fallback.action,
+      confidence: fallback.confidence,
+      reasonCode: fallback.reason_code,
+      slPoints: fallback.sl_points,
+      tpPoints: fallback.tp_points,
+      riskPercent: fallback.risk_percent,
+      source: "LOCAL_FALLBACK",
+      model: "LOCAL",
+    });
+
+    savePendingDecision(tradeId, buildSnapshotForLearning(data, response));
+
+    printDecisionSummary({
+      tradeId,
+      data,
+      baseScore,
+      learn,
+      finalLocalScore,
+      routeTier: response.route_tier,
+      apiCalled: false,
+      modelUsed: "LOCAL",
+      response,
+      strategy,
+    });
+    return res.json(response);
+  }
+
+  if (localDecision.action === "SKIP" && finalLocalScore < 0.18) {
     const response = buildDecisionResponse({
       tradeId,
       routeTier: "LOCAL_DECISION_SKIP",
@@ -2372,8 +2611,8 @@ app.post("/decision", async (req, res) => {
 
   if (
     localDecision.action !== "SKIP" &&
-    localConfidence >= 63 &&
-    finalLocalScore >= 0.5 &&
+    localConfidence >= 54 &&
+    finalLocalScore >= 0.3 &&
     !detectAbnormalMarket(data).abnormal
   ) {
     const response = buildDecisionResponse({
@@ -2413,9 +2652,9 @@ app.post("/decision", async (req, res) => {
     finalLocalScore,
   );
 
-  if (allowLocalBypass) {
+  if (allowLocalBypass && localDecision.action !== "SKIP") {
     const localAction =
-      localDecision.action !== "SKIP" && localConfidence >= 69
+      localDecision.action !== "SKIP" && localConfidence >= 65
         ? localDecision.action
         : "SKIP";
 
@@ -2510,7 +2749,7 @@ app.post("/decision", async (req, res) => {
   try {
     const initialCallType = modelUsed === PRIMARY_MODEL ? "primary" : "cheap";
     registerApiCall(initialCallType);
-    const modelResult = await callModel(modelUsed, data, decisionContext);
+    const modelResult = await callModelWithRetry(modelUsed, data, decisionContext);
 
     let reviewedResult = modelResult;
     let finalRouteTier = routeTier;
@@ -2525,7 +2764,7 @@ app.post("/decision", async (req, res) => {
 
       registerApiCall("primary");
 
-      const primaryResult = await callModel(PRIMARY_MODEL, data, decisionContext);
+      const primaryResult = await callModelWithRetry(PRIMARY_MODEL, data, decisionContext);
 
       console.log(
         `[PRIMARY] action=${primaryResult.action} conf=${primaryResult.confidence} reason=${primaryResult.reason_code}`,
@@ -2571,7 +2810,7 @@ app.post("/decision", async (req, res) => {
     );
 
     let finalAction = reviewedResult.action;
-    if (adjustedConfidence < 63) {
+    if (adjustedConfidence < 58) {
       finalAction = "SKIP";
     }
 
@@ -2619,10 +2858,10 @@ app.post("/decision", async (req, res) => {
 
     // 历史差 setup 即使模型给了 BUY/SELL，也压低
     if (learn.stats.total >= 10 && learn.stats.winRate < 0.35) {
-      adjustedConfidence = Math.min(adjustedConfidence, 62);
+      adjustedConfidence = Math.max(52, adjustedConfidence - 2);
     }
 
-    if (adjustedConfidence < 63) {
+    if (adjustedConfidence < 52) {
       finalAction = "SKIP";
     }
 
@@ -2694,7 +2933,10 @@ async function refreshStrategyNotesIfNeeded() {
   const trades = loadTrades();
   if (trades.length < 10)
     return { updated: false, reason: "NOT_ENOUGH_TRADES" };
-  if (trades.length % 10 !== 0)
+
+  const usage = loadUsageState();
+  const lastRefreshTotal = safeNumber(usage.last_strategy_refresh_total, 0);
+  if (trades.length - lastRefreshTotal < 10)
     return { updated: false, reason: "NOT_TRIGGER_POINT" };
 
   const learning = loadLearning();
@@ -2765,6 +3007,11 @@ async function refreshStrategyNotesIfNeeded() {
   };
 
   saveStrategyNotes(payload);
+
+  const usageAfter = loadUsageState();
+  usageAfter.last_strategy_refresh_total = trades.length;
+  saveUsageState(usageAfter);
+
   return { updated: true, reason: "STRATEGY_NOTES_REFRESHED", notes: payload };
 }
 
@@ -2833,6 +3080,7 @@ const server = app.listen(PORT, () => {
 app.get("/learning-status", (req, res) => {
   const learning = loadLearning();
   const buckets = Object.values(learning.buckets || {});
+  const pending = loadPending();
 
   const topBuckets = buckets
     .filter((b) => (b.total || 0) >= 3)
@@ -2853,6 +3101,7 @@ app.get("/learning-status", (req, res) => {
   res.json({
     global: learning.global,
     top_buckets: topBuckets,
+    symbols: buildSymbolSnapshots(learning, pending),
     updated_at: learning.updated_at,
   });
 });

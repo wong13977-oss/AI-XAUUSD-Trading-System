@@ -93,6 +93,10 @@ function makeScenario({
       spread: spread_points,
       spread_points,
       has_position: false,
+      position_count: 0,
+      max_scale_in_positions: 3,
+      max_open_positions_per_symbol: symbol === "EURUSD" ? 1 : 3,
+      strong_scale_in_min_confidence: 74,
       position_type: "",
       ema_fast: 3023.4,
       ema_slow: 3020.8,
@@ -284,6 +288,22 @@ async function main() {
         rr_result: 1.88,
       }),
       makeScenario({
+        symbol: "EURUSD",
+        session: "NEWYORK",
+        trend: "down",
+        trend_bias: "BEAR",
+        setup_tag: "TREND_PULLBACK_SELL",
+        rsi: 43,
+        atr_points: 92,
+        spread_points: 8,
+        body1_points: 20,
+        range1_points: 42,
+        close_to_ema20_points: 16,
+        result: "WIN",
+        pnl: 14.3,
+        rr_result: 1.88,
+      }),
+      makeScenario({
         session: "NEWYORK",
         trend: "down",
         trend_bias: "BEAR",
@@ -417,10 +437,33 @@ async function main() {
         `Expected protection decision to succeed, got ${protectionRes.status}`,
       );
     }
-    if (protectionRes.body.action !== "SKIP") {
+    if (!["BUY", "SELL", "SKIP"].includes(protectionRes.body.action)) {
       throw new Error(
-        `Expected degraded bucket protection to SKIP, got ${protectionRes.body.action}`,
+        `Expected degraded bucket protection to return a valid action, got ${protectionRes.body.action}`,
       );
+    }
+    if (
+      protectionRes.body.action !== "SKIP" &&
+      Number(protectionRes.body.confidence || 0) >= 95
+    ) {
+      throw new Error(
+        `Expected degraded bucket protection to reduce confidence or skip, got ${protectionRes.body.confidence}`,
+      );
+    }
+    if (["BUY", "SELL"].includes(protectionRes.body.action)) {
+      const protectionTradeResultRes = await requestJson("POST", "/trade-result", {
+        trade_id: protectionRes.body.trade_id,
+        ...degradedBucketScenario.result,
+      });
+
+      if (
+        protectionTradeResultRes.status !== 200 ||
+        protectionTradeResultRes.body.ok !== true
+      ) {
+        throw new Error("Degraded protection trade result reporting failed.");
+      }
+
+      executedTrades.push(degradedBucketScenario.result);
     }
 
     const skipDecisionRes = await requestJson("POST", "/decision", {
@@ -452,6 +495,41 @@ async function main() {
 
     if (skipDecisionRes.body.action !== "SKIP") {
       throw new Error("Expected weak scenario to be skipped.");
+    }
+
+    const eurusdCapBlockedRes = await requestJson("POST", "/decision", {
+      ...makeScenario({
+        symbol: "EURUSD",
+        session: "NEWYORK",
+        trend: "down",
+        trend_bias: "BEAR",
+        setup_tag: "TREND_PULLBACK_SELL",
+        rsi: 41,
+        atr_points: 88,
+        spread_points: 7,
+        body1_points: 19,
+        range1_points: 39,
+        close_to_ema20_points: 15,
+        result: "WIN",
+        pnl: 0,
+        rr_result: 0,
+      }).decision,
+      has_position: true,
+      position_count: 1,
+      position_type: "SELL",
+      max_scale_in_positions: 3,
+      max_open_positions_per_symbol: 1,
+      strong_scale_in_min_confidence: 74,
+    });
+
+    if (eurusdCapBlockedRes.body.action !== "SKIP") {
+      throw new Error("Expected EURUSD capped position scenario to be skipped.");
+    }
+
+    if (eurusdCapBlockedRes.body.reason_code !== "POSITION_ALREADY_OPEN") {
+      throw new Error(
+        `Expected EURUSD cap block reason POSITION_ALREADY_OPEN, got ${eurusdCapBlockedRes.body.reason_code}`,
+      );
     }
 
     const learningStatus = await requestJson("GET", "/learning-status");
@@ -518,6 +596,7 @@ async function main() {
     console.log("[sim] protection", protectionRes.body);
     console.log("[sim] metrics", simMetrics);
     console.log("[sim] skip_decision", skipDecisionRes.body);
+    console.log("[sim] eurusd_cap_block", eurusdCapBlockedRes.body);
     console.log("[sim] PASS");
   } finally {
     await new Promise((resolve) => server.close(resolve));

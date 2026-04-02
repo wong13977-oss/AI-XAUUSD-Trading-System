@@ -1,6 +1,6 @@
 # AI Trading System V2
 
-AI Trading System V2 is an MT5 + Node.js trading stack for `XAUUSD` intraday execution. It combines:
+AI Trading System V2 is an MT5 + Node.js trading stack for `XAUUSD` and `EURUSD` intraday execution. It combines:
 
 - an MT5 Expert Advisor (`AI_Server_Filtered_XAUUSD.mq5`)
 - a local AI decision server (`ai-server/src/server.js`)
@@ -8,6 +8,12 @@ AI Trading System V2 is an MT5 + Node.js trading stack for `XAUUSD` intraday exe
 - simulation and CSV backtest scripts for workflow validation
 
 The current implementation is built around `M15` trend-following pullback trading, with London and New York session focus, conservative risk handling, and a server-side review layer that can use OpenAI models or a local fallback decision engine.
+
+Default live deployment in this repo:
+
+- `XAUUSD` on `M15` with a maximum of `3` open positions for the symbol
+- `EURUSD` on `M15` with a maximum of `1` open position for the symbol
+- both symbols can trade at the same time because the EA counts positions per symbol
 
 ## Project Structure
 
@@ -237,19 +243,39 @@ Recommended current defaults in the EA:
 
 - symbol: `XAUUSD`
 - timeframe: `PERIOD_M15`
+- `InpMaxOpenPositionsPerSymbol=3` for the `XAUUSD` chart
+- `InpMaxOpenPositionsPerSymbol=1` for the `EURUSD` chart
 - minimum confidence: `70`
 - minimum ATR points: `130`
 - max spread points: `100`
 - session filter enabled
 - London and New York sessions enabled
 
+Symbol-specific live filter profile:
+
+- `XAUUSD`: keep the existing gold-oriented filters and position cap `3`
+- `EURUSD`: enable `InpUseEURUSDProfile=true`, use position cap `1`, and let the EA apply the built-in EURUSD thresholds automatically
+- Built-in EURUSD thresholds:
+- `max spread points = 18`
+- `min ATR points = 45`
+- `min confidence = 62`
+- `max spread to ATR ratio = 0.18`
+- `max entry stretch ATR = 1.12`
+- `pullback stretch ATR = 0.10 to 1.28`
+- `max pullback range ATR = 1.10`
+- `max pullback body share = 0.78`
+- `continuation body ATR = 0.08 to 0.42`
+- `max continuation stretch ATR = 0.38`
+- `max continuation range ATR = 0.88`
+
 In MetaTrader 5:
 
-1. Attach the EA to an `XAUUSD M15` chart.
-2. Enable Algo Trading.
-3. Add the localhost server URL to MT5 WebRequest allowed URLs.
-4. Confirm the server health check passes.
-5. Let the EA request decisions only on new bars unless you intentionally change that behavior.
+1. Attach one EA instance to an `XAUUSD M15` chart with `InpSymbol=XAUUSD`, `InpUseEURUSDProfile=false`, and `InpMaxOpenPositionsPerSymbol=3`.
+2. Attach a second EA instance to a `EURUSD M15` chart with `InpSymbol=EURUSD`, `InpUseEURUSDProfile=true`, and `InpMaxOpenPositionsPerSymbol=1`.
+3. Enable Algo Trading.
+4. Add the localhost server URL to MT5 WebRequest allowed URLs.
+5. Confirm the server health check passes on both charts.
+6. Let each EA request decisions only on new bars unless you intentionally change that behavior.
 
 ### 4. Live decision cycle
 
@@ -336,9 +362,9 @@ Separate state folders are also used for simulation and monthly estimate workflo
 
 - Keep the EA and server secrets synchronized.
 - Start with simulation mode before connecting to a live chart.
-- Review `learning-status`, `usage-status`, and `strategy-notes` regularly.
+- Review `learning-status`, `usage-status`, and `strategy-notes` regularly. The server now reports per-symbol status for `XAUUSD` and `EURUSD` in the command output and `GET /learning-status`.
 - If performance degrades in a specific bucket, the server may start filtering it aggressively by design.
-- The current codebase is specialized for `XAUUSD` and the `M15` intraday workflow, so use caution before applying it to other symbols or timeframes.
+- `XAUUSD` remains the primary tuned symbol. `EURUSD` is supported, but you should still review its learning buckets and spread/ATR behavior before increasing risk.
 
 ## Current NPM Scripts
 

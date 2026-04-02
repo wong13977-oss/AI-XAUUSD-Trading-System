@@ -32,25 +32,40 @@ input int    InpATRPeriod                = 14;
 
 input int    InpMaxSpreadPoints          = 35;
 input int    InpMinATRPoints             = 90;
-input int    InpMinConfidence            = 63;
-input double InpMaxEntryStretchATR       = 0.96;
+input int    InpMinConfidence            = 58;
+input double InpMaxEntryStretchATR       = 1.08;
 input double InpMaxImpulseRangeATR       = 1.20;
 input double InpMaxImpulseBodyShare      = 0.78;
-input double InpMaxSpreadToATRRatio      = 0.026;
+input double InpMaxSpreadToATRRatio      = 0.032;
 input double InpMinPullbackStretchATR    = 0.18;
-input double InpMaxPullbackStretchATR    = 1.32;
-input double InpMaxPullbackRangeATR      = 1.20;
-input double InpMaxPullbackBodyShare     = 0.78;
+input double InpMaxPullbackStretchATR    = 1.48;
+input double InpMaxPullbackRangeATR      = 1.35;
+input double InpMaxPullbackBodyShare     = 0.84;
 input double InpMinContinuationBodyATR   = 0.12;
-input double InpMaxContinuationStretchATR= 0.42;
-input double InpMaxContinuationRangeATR  = 1.00;
-input double InpMaxContinuationBodyATR   = 0.55;
+input double InpMaxContinuationStretchATR= 0.50;
+input double InpMaxContinuationRangeATR  = 1.12;
+input double InpMaxContinuationBodyATR   = 0.62;
+input bool   InpUseEURUSDProfile         = true;
+input int    InpEURUSDMaxSpreadPoints    = 18;
+input int    InpEURUSDMinATRPoints       = 45;
+input int    InpEURUSDMinConfidence      = 62;
+input double InpEURUSDMaxEntryStretchATR = 1.12;
+input double InpEURUSDMaxSpreadToATRRatio= 0.180;
+input double InpEURUSDMinPullbackStretchATR = 0.10;
+input double InpEURUSDMaxPullbackStretchATR = 1.28;
+input double InpEURUSDMaxPullbackRangeATR   = 1.10;
+input double InpEURUSDMaxPullbackBodyShare  = 0.78;
+input double InpEURUSDMinContinuationBodyATR= 0.08;
+input double InpEURUSDMaxContinuationStretchATR = 0.38;
+input double InpEURUSDMaxContinuationRangeATR   = 0.88;
+input double InpEURUSDMaxContinuationBodyATR    = 0.42;
 input bool   InpBlockNYBullPullback      = false;
 input int    InpCooldownBars             = 0;
 input bool   InpOnePositionOnly          = true;
+input int    InpMaxOpenPositionsPerSymbol= 1;
 input bool   InpAllowStrongSignalScaleIn = true;
 input int    InpMaxStrongSignalPositions = 3;
-input double InpStrongSignalMinConfidence= 82.0;
+input double InpStrongSignalMinConfidence= 74.0;
 input bool   InpAllowBuy                 = true;
 input bool   InpAllowSell                = true;
 input bool   InpEnablePreFilter          = true;
@@ -103,7 +118,7 @@ input double InpStrongPartialClosePercent= 20.0;
 // Daily max loss
 // =====================================================
 input bool   InpUseDailyMaxLoss          = true;
-input double InpDailyMaxLossAmount       = 80.0;
+input double InpDailyMaxLossAmount       = 140.0;
 input bool   InpClosePositionsAtLimit    = false;
 
 // =====================================================
@@ -138,6 +153,8 @@ double g_lastDecisionConfidence= 0.0;
 double g_lastDecisionSLPoints  = 0.0;
 double g_lastDecisionTPPoints  = 0.0;
 double g_lastDecisionRiskPct   = 0.0;
+string g_lastSkipStage         = "";
+string g_lastSkipReason        = "";
 
 string   g_lastLogText = "";
 datetime g_lastLogTime = 0;
@@ -166,6 +183,103 @@ void InfoPrint(string msg)
 void StatusPrint(string icon, string label, string msg)
 {
    Print("[AI-EA-V2] ", icon, " ", label, " | ", msg);
+}
+
+void SaveSkipReason(string stage, string reason)
+{
+   g_lastSkipStage  = stage;
+   g_lastSkipReason = reason;
+}
+
+void ClearSkipReason()
+{
+   g_lastSkipStage  = "";
+   g_lastSkipReason = "";
+}
+
+bool IsEURUSDProfile()
+{
+   string symbol = InpSymbol;
+   StringToUpper(symbol);
+   return (InpUseEURUSDProfile && (symbol == "EURUSD" || StringFind(symbol, "EURUSD") >= 0));
+}
+
+int EffectiveMaxSpreadPoints()
+{
+   if(IsEURUSDProfile()) return InpEURUSDMaxSpreadPoints;
+   return InpMaxSpreadPoints;
+}
+
+int EffectiveMinATRPoints()
+{
+   if(IsEURUSDProfile()) return InpEURUSDMinATRPoints;
+   return InpMinATRPoints;
+}
+
+int EffectiveMinConfidence()
+{
+   if(IsEURUSDProfile()) return InpEURUSDMinConfidence;
+   return InpMinConfidence;
+}
+
+double EffectiveMaxEntryStretchATR()
+{
+   if(IsEURUSDProfile()) return InpEURUSDMaxEntryStretchATR;
+   return InpMaxEntryStretchATR;
+}
+
+double EffectiveMaxSpreadToATRRatio()
+{
+   if(IsEURUSDProfile()) return InpEURUSDMaxSpreadToATRRatio;
+   return InpMaxSpreadToATRRatio;
+}
+
+double EffectiveMinPullbackStretchATR()
+{
+   if(IsEURUSDProfile()) return InpEURUSDMinPullbackStretchATR;
+   return InpMinPullbackStretchATR;
+}
+
+double EffectiveMaxPullbackStretchATR()
+{
+   if(IsEURUSDProfile()) return InpEURUSDMaxPullbackStretchATR;
+   return InpMaxPullbackStretchATR;
+}
+
+double EffectiveMaxPullbackRangeATR()
+{
+   if(IsEURUSDProfile()) return InpEURUSDMaxPullbackRangeATR;
+   return InpMaxPullbackRangeATR;
+}
+
+double EffectiveMaxPullbackBodyShare()
+{
+   if(IsEURUSDProfile()) return InpEURUSDMaxPullbackBodyShare;
+   return InpMaxPullbackBodyShare;
+}
+
+double EffectiveMinContinuationBodyATR()
+{
+   if(IsEURUSDProfile()) return InpEURUSDMinContinuationBodyATR;
+   return InpMinContinuationBodyATR;
+}
+
+double EffectiveMaxContinuationStretchATR()
+{
+   if(IsEURUSDProfile()) return InpEURUSDMaxContinuationStretchATR;
+   return InpMaxContinuationStretchATR;
+}
+
+double EffectiveMaxContinuationRangeATR()
+{
+   if(IsEURUSDProfile()) return InpEURUSDMaxContinuationRangeATR;
+   return InpMaxContinuationRangeATR;
+}
+
+double EffectiveMaxContinuationBodyATR()
+{
+   if(IsEURUSDProfile()) return InpEURUSDMaxContinuationBodyATR;
+   return InpMaxContinuationBodyATR;
 }
 
 // =====================================================
@@ -412,9 +526,16 @@ int GetPositionType(string symbol)
 
 bool CanOpenPosition(string action, double confidence)
 {
+   int maxOpenPositions = MathMax(1, InpMaxOpenPositionsPerSymbol);
    int totalPositions = CountOpenPositions(InpSymbol);
    if(totalPositions <= 0)
       return true;
+
+   if(totalPositions >= maxOpenPositions)
+   {
+      DebugPrint("Skip: reached max positions for symbol");
+      return false;
+   }
 
    int desiredType = -1;
    if(action == "BUY") desiredType = POSITION_TYPE_BUY;
@@ -444,7 +565,8 @@ bool CanOpenPosition(string action, double confidence)
       return false;
    }
 
-   if(totalPositions >= InpMaxStrongSignalPositions)
+   int maxScaleInPositions = MathMin(maxOpenPositions, MathMax(1, InpMaxStrongSignalPositions));
+   if(totalPositions >= maxScaleInPositions)
    {
       DebugPrint("Skip: reached max strong signal positions");
       return false;
@@ -668,7 +790,7 @@ double GetTodayTotalPL()
 bool DailyLossLimitHit()
 {
    if(!InpUseDailyMaxLoss) return false;
-   return (GetTodayTotalPL() <= -MathAbs(InpDailyMaxLossAmount));
+   return (GetTodayClosedPL() <= -MathAbs(InpDailyMaxLossAmount));
 }
 
 void CloseMyPositions()
@@ -767,20 +889,25 @@ bool DetectSetupCandidate(string bias, double close1, double high1, double low1,
 bool IsCalmEntryStructure(double atr_points, double body1_points, double range1_points, double closeToEMA20_points)
 {
    if(atr_points <= 0.0)
+   {
+      SaveSkipReason("LOCAL_PREFILTER", "ATR_INVALID");
       return false;
+   }
 
    double stretchRatio = closeToEMA20_points / atr_points;
    double rangeRatio = range1_points / atr_points;
    double bodyShare = (range1_points > 0.0 ? body1_points / range1_points : 0.0);
 
-   if(stretchRatio > InpMaxEntryStretchATR)
+   if(stretchRatio > EffectiveMaxEntryStretchATR())
    {
+      SaveSkipReason("LOCAL_PREFILTER", "ENTRY_TOO_STRETCHED");
       DebugPrint("Skip: entry too stretched from EMA20");
       return false;
    }
 
    if(rangeRatio > InpMaxImpulseRangeATR && bodyShare > InpMaxImpulseBodyShare)
    {
+      SaveSkipReason("LOCAL_PREFILTER", "CLIMACTIC_IMPULSE_BAR");
       DebugPrint("Skip: climactic impulse bar");
       return false;
    }
@@ -793,7 +920,10 @@ bool PassLiveQualityProfile(string sessionName, string bias, string setupTag, do
                             double body1_points, double range1_points, double closeToEMA20_points)
 {
    if(atr_points <= 0.0)
+   {
+      SaveSkipReason("LOCAL_QUALITY", "ATR_INVALID");
       return false;
+   }
 
    double spreadRatio = spread_points / atr_points;
    double stretchRatio = closeToEMA20_points / atr_points;
@@ -801,41 +931,49 @@ bool PassLiveQualityProfile(string sessionName, string bias, string setupTag, do
    double bodyRatio = body1_points / atr_points;
    double bodyShare = (range1_points > 0.0 ? body1_points / range1_points : 0.0);
 
-   if(InpMaxSpreadToATRRatio > 0.0 && spreadRatio > InpMaxSpreadToATRRatio)
+   double maxSpreadToATRRatio = EffectiveMaxSpreadToATRRatio();
+   if(maxSpreadToATRRatio > 0.0 && spreadRatio > maxSpreadToATRRatio)
    {
+      SaveSkipReason("LOCAL_QUALITY", "SPREAD_VS_ATR_TOO_HIGH");
       DebugPrint("Skip: spread inefficient versus ATR");
       return false;
    }
 
    if(setupTag == "TREND_PULLBACK_BUY" || setupTag == "TREND_PULLBACK_SELL")
    {
-      if(stretchRatio < InpMinPullbackStretchATR || stretchRatio > InpMaxPullbackStretchATR)
+      if(stretchRatio < EffectiveMinPullbackStretchATR() || stretchRatio > EffectiveMaxPullbackStretchATR())
       {
+         SaveSkipReason("LOCAL_QUALITY", "PULLBACK_STRETCH_OUTSIDE_PROFILE");
          DebugPrint("Skip: pullback stretch outside live profile");
          return false;
       }
-      if(rangeRatio > InpMaxPullbackRangeATR)
+      if(rangeRatio > EffectiveMaxPullbackRangeATR())
       {
+         SaveSkipReason("LOCAL_QUALITY", "PULLBACK_RANGE_TOO_LARGE");
          DebugPrint("Skip: pullback candle range too large");
          return false;
       }
-      if(bodyShare > InpMaxPullbackBodyShare)
+      if(bodyShare > EffectiveMaxPullbackBodyShare())
       {
+         SaveSkipReason("LOCAL_QUALITY", "PULLBACK_BODY_TOO_DOMINANT");
          DebugPrint("Skip: pullback candle body too dominant");
          return false;
       }
-      if(bias == "BULL" && (rsi < 51.0 || rsi > 64.0))
+      if(bias == "BULL" && (rsi < 50.0 || rsi > 66.0))
       {
+         SaveSkipReason("LOCAL_QUALITY", "BULL_PULLBACK_RSI_OUTSIDE_PROFILE");
          DebugPrint("Skip: bull pullback RSI outside profile");
          return false;
       }
-      if(bias == "BEAR" && (rsi < 36.0 || rsi > 49.0))
+      if(bias == "BEAR" && (rsi < 34.0 || rsi > 50.0))
       {
+         SaveSkipReason("LOCAL_QUALITY", "BEAR_PULLBACK_RSI_OUTSIDE_PROFILE");
          DebugPrint("Skip: bear pullback RSI outside profile");
          return false;
       }
       if(InpBlockNYBullPullback && sessionName == "NEWYORK" && bias == "BULL" && setupTag == "TREND_PULLBACK_BUY")
       {
+         SaveSkipReason("LOCAL_QUALITY", "NY_BULL_PULLBACK_DISABLED");
          DebugPrint("Skip: NY bull pullback temporarily disabled");
          return false;
       }
@@ -843,18 +981,21 @@ bool PassLiveQualityProfile(string sessionName, string bias, string setupTag, do
 
    if(setupTag == "TREND_CONTINUATION_BUY" || setupTag == "TREND_CONTINUATION_SELL")
    {
-      if(stretchRatio > InpMaxContinuationStretchATR)
+      if(stretchRatio > EffectiveMaxContinuationStretchATR())
       {
+         SaveSkipReason("LOCAL_QUALITY", "CONTINUATION_TOO_STRETCHED");
          DebugPrint("Skip: continuation too stretched");
          return false;
       }
-      if(rangeRatio > InpMaxContinuationRangeATR)
+      if(rangeRatio > EffectiveMaxContinuationRangeATR())
       {
+         SaveSkipReason("LOCAL_QUALITY", "CONTINUATION_RANGE_TOO_LARGE");
          DebugPrint("Skip: continuation range too large");
          return false;
       }
-      if(bodyRatio < InpMinContinuationBodyATR || bodyRatio > InpMaxContinuationBodyATR)
+      if(bodyRatio < EffectiveMinContinuationBodyATR() || bodyRatio > EffectiveMaxContinuationBodyATR())
       {
+         SaveSkipReason("LOCAL_QUALITY", "CONTINUATION_BODY_OUTSIDE_PROFILE");
          DebugPrint("Skip: continuation body outside profile");
          return false;
       }
@@ -869,43 +1010,53 @@ bool PreFilterPass(double spread_points, double atr_points, string bias, string 
    if(!InpEnablePreFilter)
       return true;
 
-   if(spread_points > InpMaxSpreadPoints)
+   ClearSkipReason();
+
+   if(spread_points > EffectiveMaxSpreadPoints())
    {
+      SaveSkipReason("LOCAL_PREFILTER", "SPREAD_TOO_HIGH");
       DebugPrint("Skip: spread too high");
       return false;
    }
-   if(atr_points < InpMinATRPoints)
+   if(atr_points < EffectiveMinATRPoints())
    {
+      SaveSkipReason("LOCAL_PREFILTER", "ATR_TOO_LOW");
       DebugPrint("Skip: ATR too low");
       return false;
    }
    if(!IsTradingSessionAllowed())
    {
+      SaveSkipReason("LOCAL_PREFILTER", "SESSION_FILTER");
       DebugPrint("Skip: session filter");
       return false;
    }
    if(IsNewsBlockedNow())
    {
+      SaveSkipReason("LOCAL_PREFILTER", "NEWS_FILTER");
       DebugPrint("Skip: news filter");
       return false;
    }
    if(DailyLossLimitHit())
    {
+      SaveSkipReason("LOCAL_PREFILTER", "DAILY_LOSS_LIMIT");
       DebugPrint("Skip: daily loss limit");
       return false;
    }
    if(InCooldown())
    {
+      SaveSkipReason("LOCAL_PREFILTER", "COOLDOWN");
       DebugPrint("Skip: cooldown");
       return false;
    }
    if(bias == "NEUTRAL")
    {
+      SaveSkipReason("LOCAL_PREFILTER", "NO_CLEAR_TREND_BIAS");
       DebugPrint("Skip: no clear trend bias");
       return false;
    }
    if(!setupOk)
    {
+      SaveSkipReason("LOCAL_PREFILTER", "NO_VALID_TREND_SETUP");
       DebugPrint("Skip: no valid trend setup");
       return false;
    }
@@ -1036,6 +1187,8 @@ bool RequestDecision(string &responseText)
    if(!InpEnableServerReview)
       return false;
 
+   ClearSkipReason();
+
    double emaFast, emaSlow, ema20, rsi, atr;
    if(!ReadBufferValue(hFastEMA, 1, emaFast)) return false;
    if(!ReadBufferValue(hSlowEMA, 1, emaSlow)) return false;
@@ -1076,7 +1229,11 @@ bool RequestDecision(string &responseText)
    );
 
    if(!PreFilterPass(spread_points, atr_points, bias, setupTag, setupOk, rsi, body1, range1, closeToEMA20))
+   {
+      StatusPrint("⏭️", "Skip", StringFormat("stage=%s | reason=%s | session=%s | bias=%s | setup=%s | spread=%.1f | atr=%.1f",
+         g_lastSkipStage, g_lastSkipReason, GetSessionName(), bias, setupTag, spread_points, atr_points));
       return false;
+   }
       
    string trend = "range";
    if(bias == "BULL") trend = "up";
@@ -1105,6 +1262,7 @@ bool RequestDecision(string &responseText)
    "\"position_type\":\"%s\","
    "\"position_count\":%d,"
    "\"max_scale_in_positions\":%d,"
+   "\"max_open_positions_per_symbol\":%d,"
    "\"strong_scale_in_min_confidence\":%.1f,"
 
    "\"ema_fast\":%.2f,"
@@ -1139,6 +1297,7 @@ bool RequestDecision(string &responseText)
    posTypeStr,
    posCount,
    InpMaxStrongSignalPositions,
+   InpMaxOpenPositionsPerSymbol,
    InpStrongSignalMinConfidence,
 
    emaFast,
@@ -1243,142 +1402,140 @@ void ManagePartialTP()
 {
    if(!InpUsePartialTP) return;
 
-   ulong ticket = 0;
-   long posId = 0;
-   int type = -1;
-   double openPrice = 0, sl = 0, tp = 0, volume = 0;
-   string comment = "";
-
-   if(!GetMyPosition(ticket, posId, type, openPrice, sl, tp, volume, comment)) return;
-   if(IsPartialDone(posId)) return;
-
-   double initSL = LoadInitSL(posId);
-   if(initSL <= 0.0)
-   {
-      if(sl > 0.0)
-      {
-         initSL = sl;
-         SaveInitSL(posId, initSL);
-      }
-      else return;
-   }
-
-   double riskDistance = MathAbs(openPrice - initSL);
-   if(riskDistance <= 0.0) return;
-   double decisionConf = LoadDecisionConfidence(posId);
-
-   double bid = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
-   double ask = SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
-   double priceNow = (type == POSITION_TYPE_BUY ? bid : ask);
-   double partialRR = AdaptivePartialRR(decisionConf);
-
-   double targetPrice = 0.0;
-   bool hitTarget = false;
-
-   if(type == POSITION_TYPE_BUY)
-   {
-      targetPrice = openPrice + (riskDistance * partialRR);
-      hitTarget = (priceNow >= targetPrice);
-   }
-   else
-   {
-      targetPrice = openPrice - (riskDistance * partialRR);
-      hitTarget = (priceNow <= targetPrice);
-   }
-
-   if(!hitTarget) return;
-
-   double closeVol = NormalizeLot(volume * (AdaptivePartialClosePercent(decisionConf) / 100.0));
+   double bid    = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
+   double ask    = SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
    double minLot = SymbolInfoDouble(InpSymbol, SYMBOL_VOLUME_MIN);
-   double remain = volume - closeVol;
 
-   if(closeVol < minLot || remain < minLot)
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      SavePartialDone(posId);
-      return;
-   }
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != InpSymbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
 
-   trade.SetExpertMagicNumber(InpMagic);
-   trade.SetDeviationInPoints(InpDeviationPoints);
+      long   posId     = PositionGetInteger(POSITION_IDENTIFIER);
+      int    type      = (int)PositionGetInteger(POSITION_TYPE);
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl        = PositionGetDouble(POSITION_SL);
+      double tp        = PositionGetDouble(POSITION_TP);
+      double volume    = PositionGetDouble(POSITION_VOLUME);
 
-   bool ok = trade.PositionClosePartial(ticket, closeVol, InpDeviationPoints);
-   if(ok)
-   {
-      SavePartialDone(posId);
-      StatusPrint("💼", "Partial", StringFormat("taken | rr=%.2f | close=%.2f%%", partialRR, AdaptivePartialClosePercent(decisionConf)));
+      if(IsPartialDone(posId)) continue;
 
-      if(InpMoveSLToBEAfterPart && PositionSelectByTicket(ticket))
+      double initSL = LoadInitSL(posId);
+      if(initSL <= 0.0)
       {
-         double curTP = PositionGetDouble(POSITION_TP);
-         trade.PositionModify(ticket, NormalizePrice(openPrice), curTP);
-         StatusPrint("🛡️", "SL", "moved to breakeven after partial");
+         if(sl > 0.0) { initSL = sl; SaveInitSL(posId, initSL); }
+         else continue;
+      }
+
+      double riskDistance = MathAbs(openPrice - initSL);
+      if(riskDistance <= 0.0) continue;
+
+      double decisionConf = LoadDecisionConfidence(posId);
+      double priceNow     = (type == POSITION_TYPE_BUY ? bid : ask);
+      double partialRR    = AdaptivePartialRR(decisionConf);
+      double targetPrice  = (type == POSITION_TYPE_BUY)
+                           ? openPrice + riskDistance * partialRR
+                           : openPrice - riskDistance * partialRR;
+      bool hitTarget = (type == POSITION_TYPE_BUY) ? (priceNow >= targetPrice) : (priceNow <= targetPrice);
+      if(!hitTarget) continue;
+
+      double closeVol = NormalizeLot(volume * (AdaptivePartialClosePercent(decisionConf) / 100.0));
+      double remain   = volume - closeVol;
+      if(closeVol < minLot || remain < minLot) { SavePartialDone(posId); continue; }
+
+      trade.SetExpertMagicNumber(InpMagic);
+      trade.SetDeviationInPoints(InpDeviationPoints);
+
+      bool ok = trade.PositionClosePartial(ticket, closeVol, InpDeviationPoints);
+      if(ok)
+      {
+         SavePartialDone(posId);
+         StatusPrint("💼", "Partial", StringFormat("taken | rr=%.2f | close=%.2f%%", partialRR, AdaptivePartialClosePercent(decisionConf)));
+
+         if(InpMoveSLToBEAfterPart && PositionSelectByTicket(ticket))
+         {
+            double curTP2 = PositionGetDouble(POSITION_TP);
+            trade.PositionModify(ticket, NormalizePrice(openPrice), curTP2);
+            StatusPrint("🛡️", "SL", "moved to breakeven after partial");
+         }
       }
    }
 }
 
 void ManageTrailingStop()
 {
-   ulong ticket = 0;
-   long posId = 0;
-   int type = -1;
-   double openPrice = 0, sl = 0, tp = 0, volume = 0;
-   string comment = "";
-
-   if(!GetMyPosition(ticket, posId, type, openPrice, sl, tp, volume, comment)) return;
-
-   double initSL = LoadInitSL(posId);
-   if(initSL <= 0.0) return;
-   if(InpTrailAfterPartialOnly && !IsPartialDone(posId)) return;
-
-   double bid = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
-   double ask = SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
-   double currentPrice = (type == POSITION_TYPE_BUY ? bid : ask);
-   double rrNow = GetCurrentRR(type, openPrice, currentPrice, initSL);
-   double decisionConf = LoadDecisionConfidence(posId);
-   double trailActivateRR = AdaptiveTrailActivateRR(decisionConf);
-   double breakevenRR = AdaptiveBreakevenRR(decisionConf);
-   if(rrNow < trailActivateRR) return;
-
    double ema20 = 0.0;
-   double atr = 0.0;
+   double atr   = 0.0;
    if(InpUseEMA20Trailing && !ReadBufferValue(hEMA20, 1, ema20)) return;
-   if(InpUseATRTrailing && !ReadBufferValue(hATR, 1, atr)) return;
+   if(InpUseATRTrailing   && !ReadBufferValue(hATR,   1, atr))   return;
 
-   double point = SafePoint();
-   int stopsLevel = (int)SymbolInfoInteger(InpSymbol, SYMBOL_TRADE_STOPS_LEVEL);
-   double minStopDistance = stopsLevel * point;
-   double newSL = sl;
+   double point       = SafePoint();
+   int    stopsLevel  = (int)SymbolInfoInteger(InpSymbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minStopDist = stopsLevel * point;
+   double bid         = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
+   double ask         = SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
 
-   if(type == POSITION_TYPE_BUY)
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      double candidate = (sl > 0.0 ? sl : initSL);
-      if(InpUseEMA20Trailing) candidate = MathMax(candidate, ema20);
-      if(rrNow >= breakevenRR && candidate < openPrice) candidate = openPrice;
-      if(InpUseATRTrailing) candidate = MathMax(candidate, bid - atr * AdaptiveAtrTrailMult(decisionConf));
-      double maxAllowedSL = bid - minStopDistance;
-      if(candidate > maxAllowedSL) candidate = maxAllowedSL;
-      if(IsPartialDone(posId) && candidate < openPrice) candidate = openPrice;
-      if(candidate > sl + point * 5) newSL = candidate;
-   }
-   else
-   {
-      double candidate = (sl > 0.0 ? sl : initSL);
-      if(InpUseEMA20Trailing) candidate = MathMin(candidate, ema20);
-      if(rrNow >= breakevenRR && candidate > openPrice) candidate = openPrice;
-      if(InpUseATRTrailing) candidate = MathMin(candidate, ask + atr * AdaptiveAtrTrailMult(decisionConf));
-      double minAllowedSL = ask + minStopDistance;
-      if(candidate < minAllowedSL) candidate = minAllowedSL;
-      if(IsPartialDone(posId) && candidate > openPrice) candidate = openPrice;
-      if(candidate < sl - point * 5 || sl <= 0.0) newSL = candidate;
-   }
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != InpSymbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagic) continue;
 
-   newSL = NormalizePrice(newSL);
-   if(newSL > 0.0 && MathAbs(newSL - sl) > point * 5)
-   {
-      trade.SetExpertMagicNumber(InpMagic);
-      trade.SetDeviationInPoints(InpDeviationPoints);
-      trade.PositionModify(ticket, newSL, tp);
-      StatusPrint("🧵", "Trail", StringFormat("updated | rr=%.2f | new_sl=%.1f", rrNow, MathAbs(openPrice - newSL) / point));
+      long   posId     = PositionGetInteger(POSITION_IDENTIFIER);
+      int    type      = (int)PositionGetInteger(POSITION_TYPE);
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double sl        = PositionGetDouble(POSITION_SL);
+      double tp        = PositionGetDouble(POSITION_TP);
+
+      double initSL = LoadInitSL(posId);
+      if(initSL <= 0.0) continue;
+      if(InpTrailAfterPartialOnly && !IsPartialDone(posId)) continue;
+
+      double currentPrice    = (type == POSITION_TYPE_BUY ? bid : ask);
+      double rrNow           = GetCurrentRR(type, openPrice, currentPrice, initSL);
+      double decisionConf    = LoadDecisionConfidence(posId);
+      double trailActivateRR = AdaptiveTrailActivateRR(decisionConf);
+      double breakevenRR     = AdaptiveBreakevenRR(decisionConf);
+      if(rrNow < trailActivateRR) continue;
+
+      double newSL = sl;
+
+      if(type == POSITION_TYPE_BUY)
+      {
+         double candidate = (sl > 0.0 ? sl : initSL);
+         if(InpUseEMA20Trailing) candidate = MathMax(candidate, ema20);
+         if(rrNow >= breakevenRR && candidate < openPrice) candidate = openPrice;
+         if(InpUseATRTrailing) candidate = MathMax(candidate, bid - atr * AdaptiveAtrTrailMult(decisionConf));
+         double maxAllowedSL = bid - minStopDist;
+         if(candidate > maxAllowedSL) candidate = maxAllowedSL;
+         if(IsPartialDone(posId) && candidate < openPrice) candidate = openPrice;
+         if(candidate > sl + point * 5) newSL = candidate;
+      }
+      else
+      {
+         double candidate = (sl > 0.0 ? sl : initSL);
+         if(InpUseEMA20Trailing) candidate = MathMin(candidate, ema20);
+         if(rrNow >= breakevenRR && candidate > openPrice) candidate = openPrice;
+         if(InpUseATRTrailing) candidate = MathMin(candidate, ask + atr * AdaptiveAtrTrailMult(decisionConf));
+         double minAllowedSL = ask + minStopDist;
+         if(candidate < minAllowedSL) candidate = minAllowedSL;
+         if(IsPartialDone(posId) && candidate > openPrice) candidate = openPrice;
+         if(candidate < sl - point * 5 || sl <= 0.0) newSL = candidate;
+      }
+
+      newSL = NormalizePrice(newSL);
+      if(newSL > 0.0 && MathAbs(newSL - sl) > point * 5)
+      {
+         trade.SetExpertMagicNumber(InpMagic);
+         trade.SetDeviationInPoints(InpDeviationPoints);
+         trade.PositionModify(ticket, newSL, tp);
+         StatusPrint("🧵", "Trail", StringFormat("updated | rr=%.2f | new_sl=%.1f", rrNow, MathAbs(openPrice - newSL) / point));
+      }
    }
 }
 
@@ -1506,7 +1663,24 @@ void CheckRecentlyClosedTradesAndReport()
       if(totalPnl > 0.0) resultLabel = "WIN";
       if(totalPnl < 0.0) resultLabel = "LOSS";
 
+      // Determine close reason from the final closing deal for this position
       string closeReason = (totalPnl >= 0.0 ? "TP_OR_TRAIL" : "SL_OR_STOP");
+      for(int j = 0; j < deals; j++)
+      {
+         ulong closeDealTick = HistoryDealGetTicket(j);
+         if(closeDealTick == 0) continue;
+         if(HistoryDealGetString(closeDealTick, DEAL_SYMBOL) != InpSymbol) continue;
+         if(HistoryDealGetInteger(closeDealTick, DEAL_MAGIC) != InpMagic) continue;
+         if(HistoryDealGetInteger(closeDealTick, DEAL_POSITION_ID) != posId) continue;
+         long closeEntry = HistoryDealGetInteger(closeDealTick, DEAL_ENTRY);
+         if(closeEntry != DEAL_ENTRY_OUT && closeEntry != DEAL_ENTRY_OUT_BY) continue;
+         long dealReason = HistoryDealGetInteger(closeDealTick, DEAL_REASON);
+         if(dealReason == DEAL_REASON_TP)           closeReason = "FULL_TP";
+         else if(dealReason == DEAL_REASON_SL)      closeReason = "STOP_LOSS";
+         else if(dealReason == DEAL_REASON_EXPERT)  closeReason = "TRAIL_OR_PARTIAL";
+         else                                       closeReason = "OTHER_CLOSE";
+         // Don't break — iterate all so the last (final) close reason wins
+      }
       double holdingMinutes = (entryTime > 0 ? (double)(TimeCurrent() - entryTime) / 60.0 : 0.0);
 
       if(tradeId == "")
@@ -1545,7 +1719,35 @@ void ProcessDecision(const string response)
    double risk_percent = JsonGetNumber(decisionJson, "risk_percent");
 
    if(DailyLossLimitHit()) return;
-   if(confidence < InpMinConfidence) return;
+
+   g_lastDecisionTradeId    = tradeId;
+   g_lastDecisionAction     = action;
+   g_lastDecisionTier       = routeTier;
+   g_lastDecisionReason     = reasonCode;
+   g_lastDecisionSource     = source;
+   g_lastDecisionModel      = model;
+   g_lastDecisionConfidence = confidence;
+
+   if(action == "SKIP")
+   {
+      SaveSkipReason("SERVER_DECISION", reasonCode);
+      StatusPrint("⏭️", "Skip", StringFormat(
+         "stage=SERVER_DECISION | reason=%s | conf=%.0f | tier=%s | src=%s | model=%s | id=%s",
+         reasonCode, confidence, routeTier, source, model, tradeId
+      ));
+      return;
+   }
+
+   int minConfidence = EffectiveMinConfidence();
+   if(confidence < minConfidence)
+   {
+      SaveSkipReason("SERVER_CONFIDENCE", reasonCode);
+      StatusPrint("⏭️", "Skip", StringFormat(
+         "stage=SERVER_CONFIDENCE | reason=%s | conf=%.0f < min=%d | tier=%s | id=%s",
+         reasonCode, confidence, minConfidence, routeTier, tradeId
+      ));
+      return;
+   }
 
    double atr;
    if(!ReadBufferValue(hATR, 1, atr)) return;
@@ -1567,13 +1769,6 @@ void ProcessDecision(const string response)
    if(tp_points <= 0.0 || tp_points < sl_points * min_rr)
       tp_points = sl_points * preferred_rr;
 
-   g_lastDecisionTradeId  = tradeId;
-   g_lastDecisionAction   = action;
-   g_lastDecisionTier     = routeTier;
-   g_lastDecisionReason   = reasonCode;
-   g_lastDecisionSource   = source;
-   g_lastDecisionModel    = model;
-   g_lastDecisionConfidence = confidence;
    g_lastDecisionSLPoints = sl_points;
    g_lastDecisionTPPoints = tp_points;
    double serverRisk = (risk_percent > 0.0 ? risk_percent : InpRiskPercentFallback);
@@ -1612,7 +1807,9 @@ int OnInit()
       return INIT_FAILED;
    }
 
-   InfoPrint("AI EA V2 initialized");
+   string profileName = IsEURUSDProfile() ? "EURUSD" : "XAUUSD";
+   InfoPrint(StringFormat("AI EA V2 initialized | symbol=%s | profile=%s | max_spread=%d | min_atr=%d | min_conf=%d",
+      InpSymbol, profileName, EffectiveMaxSpreadPoints(), EffectiveMinATRPoints(), EffectiveMinConfidence()));
    return INIT_SUCCEEDED;
 }
 
