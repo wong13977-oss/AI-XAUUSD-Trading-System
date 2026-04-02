@@ -1,25 +1,28 @@
 # AI Trading System V2
 
-AI Trading System V2 is an MT5 + Node.js trading stack for `XAUUSD` and `EURUSD` intraday execution. It combines:
+AI Trading System V2 is a local MT5 + Node.js trading stack that connects a MetaTrader 5 Expert Advisor to a decision server with learning, usage tracking, and simulation workflows.
 
-- an MT5 Expert Advisor (`AI_Server_Filtered_XAUUSD.mq5`)
-- a local AI decision server (`ai-server/src/server.js`)
-- learning/state files that track historical performance by setup bucket
-- simulation and CSV backtest scripts for workflow validation
+This repository currently targets intraday `M15` trading for:
 
-The current implementation is built around `M15` trend-following pullback trading, with London and New York session focus, conservative risk handling, and a server-side review layer that can use OpenAI models or a local fallback decision engine.
+- `XAUUSD`
+- `EURUSD`
 
-Default live deployment in this repo:
+The system is built around a filtered trend-following model with pullback and continuation detection, session-aware routing, conservative risk controls, and a server-side review layer that can run with OpenAI models or local-only fallback logic.
 
-- `XAUUSD` on `M15` with a maximum of `3` open positions for the symbol
-- `EURUSD` on `M15` with a maximum of `1` open position for the symbol
-- both symbols can trade at the same time because the EA counts positions per symbol
+## Components
 
-## Project Structure
+- `AI_Server_Filtered_XAUUSD.mq5`: MetaTrader 5 Expert Advisor
+- `AI_Server_Filtered_XAUUSD.ex5`: compiled EA artifact
+- `ai-server/src/server.js`: local decision server
+- `ai-server/src/simulate.js`: compatibility simulation runner
+- `ai-server/src/backtest_from_csv.js`: CSV backtest runner
+
+## Repository Layout
 
 ```text
 AI Trading System V2/
 |- AI_Server_Filtered_XAUUSD.mq5
+|- AI_Server_Filtered_XAUUSD.ex5
 |- README.md
 `- ai-server/
    |- package.json
@@ -37,156 +40,86 @@ AI Trading System V2/
       `- monthly_estimate_state/
 ```
 
-## Architecture And Workflow
+## How It Works
 
-### 1. MT5 EA side
+### EA flow
 
-The EA runs on MetaTrader 5 and:
+The MT5 EA:
 
-- reads market state from the chart and indicators
-- applies basic local filters such as session, spread, ATR, cooldown, and one-position-only
-- sends a JSON payload to the AI server `/decision`
+- reads chart state and indicators
+- applies local guards such as spread, ATR, cooldown, session, and position-count checks
+- sends a JSON payload to the Node server
 - receives `BUY`, `SELL`, or `SKIP`
-- opens and manages trades using the returned confidence, SL/TP, and risk values
-- reports the final result back to `/trade-result`
+- executes and manages the trade locally
+- reports the final trade result back to the server
 
-Default MT5 endpoints in the EA:
+Default endpoints used by the EA:
 
+- `GET /health`
+- `POST /decision`
+- `POST /trade-result`
+
+Typical local URLs:
+
+- `http://127.0.0.1:3000/health`
 - `http://127.0.0.1:3000/decision`
 - `http://127.0.0.1:3000/trade-result`
-- `http://127.0.0.1:3000/health`
 
-### 2. AI server side
+### Server flow
 
 The Node server:
 
-- scores every setup locally first
-- checks historical performance for the same setup bucket
-- optionally applies strategy-note adjustments from recent trade history
-- decides whether to block locally, allow locally, call the cheap model, escalate to the primary model, or apply abnormal-market review
-- stores pending decisions so the final trade result can be matched back to the original setup
-- updates learning statistics after each closed trade
-- refreshes strategy notes every 10 trades
+- evaluates each setup with local scoring first
+- checks learning data for similar setup buckets
+- optionally calls a cheaper model or a primary model
+- stores pending trade context until the final result arrives
+- updates learning statistics after trade close
+- tracks estimated model usage and monthly budget consumption
+- refreshes strategy notes from recent performance
 
-### 3. Learning loop
+### Learning model
 
-Every trade result updates:
-
-- global performance
-- bucket-level performance
-- route-tier performance
-- confidence-bucket performance
-- action-level performance
-
-Buckets are grouped by:
+The learning state is updated from closed trades and grouped by dimensions such as:
 
 - symbol
 - timeframe
+- session
 - trend bias
 - setup tag
-- session
+- confidence bucket
+- action and route tier
 
-If a bucket becomes statistically weak, the system reduces confidence or blocks it completely.
+Weak buckets can be penalized or blocked automatically.
 
-## Trading Strategy
+## Current Trading Profile
 
-This version is designed for a disciplined, trend-following pullback model on `XAUUSD`.
+The repo is currently tuned for `M15` intraday trading with London and New York session focus.
 
-### Core market idea
+Live defaults described in the existing strategy:
 
-- trade with the dominant direction only
-- prefer pullbacks rather than chasing extended candles
-- favor London and New York sessions
-- avoid weak volatility, abnormal spread, and overstretched price from EMA20
+- `XAUUSD`: up to `3` open positions per symbol
+- `EURUSD`: up to `1` open position per symbol
 
-### Main directional logic
+The EA contains a dedicated EURUSD profile toggle and different spread / ATR / confidence thresholds for that symbol.
 
-Bullish bias is preferred when:
-
-- price structure is aligned upward
-- fast EMA is above slow EMA
-- price is above EMA20
-- RSI supports a bullish continuation context
-- setup tag indicates a bullish pullback
-
-Bearish bias is preferred when:
-
-- price structure is aligned downward
-- fast EMA is below slow EMA
-- price is below EMA20
-- RSI supports a bearish continuation context
-- setup tag indicates a bearish pullback
-
-### Local scoring factors
-
-The local score rewards:
-
-- trend and RSI alignment
-- matching setup direction (`TREND_PULLBACK_BUY` / `TREND_PULLBACK_SELL`)
-- enough ATR / range
-- tighter spread
-- healthy candle body and range
-- reasonable distance to EMA20
-
-The local score is penalized by:
-
-- existing open position
-- news block flag
-- daily loss lock
-
-### Decision routing
-
-The server uses a layered decision flow:
-
-1. Reject bad historical buckets immediately.
-2. Skip very low local scores without any model call.
-3. Auto-allow very high local scores without any model call.
-4. Use the cheap model for middle-zone setups.
-5. Escalate to the primary model when the setup is near tradable threshold or bucket history is weak/unclear.
-6. Run abnormal-market review when spread, ATR, candle range, or distance from EMA20 looks extreme.
-
-### Risk profile
-
-The system is intentionally conservative:
-
-- `SKIP` is valid and expected often
-- risk percent is typically around `0.30` to `0.45`
-- minimum reward-to-risk target is around `1.6`
-- stronger setups can push RR toward `1.9` to `2.1`
-- abnormal conditions may reduce risk further or block the trade
-
-### Trade management in the EA
-
-The EA currently supports:
-
-- fixed lot or risk-based lot sizing
-- ATR and EMA20 trailing
-- partial take profit
-- move stop to breakeven after partial
-- daily max loss guard
-- cooldown between entries
-- one-position-only mode
-
-## Run Procedure
-
-### Requirements
+## Requirements
 
 - Windows with MetaTrader 5
 - Node.js
-- an OpenAI API key if you want live model calls
+- OpenAI API key only if you want live model calls
 
-The server can also run without live model calls by using its built-in local fallback logic.
+The server can still run in local-only mode with `ENABLE_MODEL_CALLS=0`.
 
-### 1. Prepare the server
+## Quick Start
 
-From the project root:
+### 1. Install server dependencies
 
 ```powershell
 cd "C:\Users\xianq\AI Trading System V2\ai-server"
 npm install
 ```
 
-Create or update `ai-server/.env`.
+### 2. Create `ai-server/.env`
 
 Example:
 
@@ -200,22 +133,62 @@ ENABLE_MODEL_CALLS=1
 SIMULATION_MODE=0
 MAX_DAILY_CALLS=20
 MONTHLY_BUDGET_USD=30
+TRACKED_SYMBOLS=XAUUSD,EURUSD
 ```
 
-Important:
+Important notes:
 
-- use the same `API_SECRET` in both the Node server and the MT5 EA
-- do not commit real secrets or API keys
-- if you want local-only decisions, set `ENABLE_MODEL_CALLS=0`
+- `API_SECRET` must match on both the EA and the Node server
+- keep real secrets out of version control
+- set `ENABLE_MODEL_CALLS=0` to force local-only decisions
+- `SIMULATION_MODE=1` is intended for simulation workflows, not live trading
 
-### 2. Start the server
+## Environment Variables
+
+`server.js` supports these core settings:
+
+- `PORT`: server port, default `3000`
+- `API_SECRET`: shared secret checked through `x-api-secret`
+- `OPENAI_API_KEY`: required only when model calls are enabled
+- `ENABLE_MODEL_CALLS`: `0` disables remote model usage
+- `SIMULATION_MODE`: `1` enables simulation behavior
+- `DATA_DIR`: override the directory used for JSON state files
+- `TRADES_FILE`
+- `PENDING_FILE`
+- `LEARNING_FILE`
+- `STRATEGY_NOTES_FILE`
+- `USAGE_STATE_FILE`
+- `TRACKED_SYMBOLS`: default `XAUUSD,EURUSD`
+- `PRIMARY_MODEL`: default `gpt-5.4`
+- `CHEAP_MODEL`: default `gpt-5.4-mini`
+- `MAX_DAILY_CALLS`: default `20`
+- `MONTHLY_BUDGET_USD`: default `30`
+- `BASE_MONTHLY_TARGET_USD`: default `20`
+- `ESTIMATED_CHEAP_CALL_USD`
+- `ESTIMATED_PRIMARY_CALL_USD`
+- `ESTIMATED_SUMMARY_CALL_USD`
+- `ESTIMATED_ABNORMAL_CALL_USD`
+
+CSV backtesting also supports:
+
+- `BT_SYMBOL`
+- `BT_TIMEFRAME`
+- `BT_INITIAL_BALANCE`
+- `BT_POINT_SIZE`
+- `BT_RISK_PERCENT_FALLBACK`
+
+## Running The Server
+
+Start the API:
 
 ```powershell
 cd "C:\Users\xianq\AI Trading System V2\ai-server"
 npm start
 ```
 
-The main server runs from `ai-server/src/server.js` and exposes:
+The server entry point is `ai-server/src/server.js`.
+
+Available endpoints:
 
 - `GET /health`
 - `POST /health`
@@ -226,97 +199,50 @@ The main server runs from `ai-server/src/server.js` and exposes:
 - `GET /startup-status`
 - `GET /strategy-notes`
 
-### 3. Configure MT5
+## MT5 Setup
 
-Open `AI_Server_Filtered_XAUUSD.mq5` in MetaEditor and compile it.
-
-Check these input values:
-
-- `InpServerUrl`
-- `InpTradeResultUrl`
-- `InpHealthUrl`
-- `InpApiSecret`
-- `InpSymbol`
-- `InpTF`
-
-Recommended current defaults in the EA:
-
-- symbol: `XAUUSD`
-- timeframe: `PERIOD_M15`
-- `InpMaxOpenPositionsPerSymbol=3` for the `XAUUSD` chart
-- `InpMaxOpenPositionsPerSymbol=1` for the `EURUSD` chart
-- minimum confidence: `70`
-- minimum ATR points: `130`
-- max spread points: `100`
-- session filter enabled
-- London and New York sessions enabled
-
-Symbol-specific live filter profile:
-
-- `XAUUSD`: keep the existing gold-oriented filters and position cap `3`
-- `EURUSD`: enable `InpUseEURUSDProfile=true`, use position cap `1`, and let the EA apply the built-in EURUSD thresholds automatically
-- Built-in EURUSD thresholds:
-- `max spread points = 18`
-- `min ATR points = 45`
-- `min confidence = 62`
-- `max spread to ATR ratio = 0.18`
-- `max entry stretch ATR = 1.12`
-- `pullback stretch ATR = 0.10 to 1.28`
-- `max pullback range ATR = 1.10`
-- `max pullback body share = 0.78`
-- `continuation body ATR = 0.08 to 0.42`
-- `max continuation stretch ATR = 0.38`
-- `max continuation range ATR = 0.88`
-
-In MetaTrader 5:
-
-1. Attach one EA instance to an `XAUUSD M15` chart with `InpSymbol=XAUUSD`, `InpUseEURUSDProfile=false`, and `InpMaxOpenPositionsPerSymbol=3`.
-2. Attach a second EA instance to a `EURUSD M15` chart with `InpSymbol=EURUSD`, `InpUseEURUSDProfile=true`, and `InpMaxOpenPositionsPerSymbol=1`.
-3. Enable Algo Trading.
+1. Open `AI_Server_Filtered_XAUUSD.mq5` in MetaEditor and compile it.
+2. Confirm the EA inputs point to your local server URLs.
+3. Set the same `API_SECRET` in the EA and the Node server.
 4. Add the localhost server URL to MT5 WebRequest allowed URLs.
-5. Confirm the server health check passes on both charts.
-6. Let each EA request decisions only on new bars unless you intentionally change that behavior.
+5. Enable Algo Trading.
+6. Verify the EA health check succeeds before enabling live execution.
 
-### 4. Live decision cycle
+Recommended chart setup from the current project profile:
 
-Once running, the cycle is:
+1. Attach one EA instance to `XAUUSD M15` with `InpSymbol=XAUUSD` and `InpMaxOpenPositionsPerSymbol=3`.
+2. Attach one EA instance to `EURUSD M15` with `InpSymbol=EURUSD`, `InpUseEURUSDProfile=true`, and `InpMaxOpenPositionsPerSymbol=1`.
 
-1. New bar or trade-check event happens in MT5.
-2. EA builds a payload with trend, RSI, ATR, spread, candle stats, session, and setup tag.
-3. Server returns a decision with `action`, `confidence`, `sl_points`, `tp_points`, `risk_percent`, `route_tier`, `source`, and `model`.
-4. EA opens or skips the trade.
-5. When the trade closes, EA posts the result back to `/trade-result`.
-6. Server updates learning and possibly refreshes strategy notes.
+## Simulation
 
-## Simulation And Backtesting
-
-### Quick compatibility simulation
-
-This validates the end-to-end server workflow without MT5 live execution.
+Run the compatibility simulation:
 
 ```powershell
 cd "C:\Users\xianq\AI Trading System V2\ai-server"
 npm run simulate
 ```
 
-What it checks:
+`npm run compat-check` currently runs the same simulation entry point.
 
-- decision endpoint behavior
+The simulation validates the end-to-end loop:
+
+- health checks
+- decision requests
 - pending trade tracking
-- trade-result learning updates
-- strategy notes refresh
-- learning-block behavior for weak buckets
-- usage/budget accounting
+- trade result reporting
+- learning updates
+- strategy note refresh
+- usage tracking
 
-`npm run compat-check` currently runs the same simulation flow.
+Simulation state is stored under `ai-server/src/simulation_state/`.
 
-### CSV backtest
+## CSV Backtesting
 
-You can backtest from historical bar data exported from MT5.
+Run a backtest from MT5-exported bar data:
 
 ```powershell
 cd "C:\Users\xianq\AI Trading System V2\ai-server"
-npm run backtest:csv -- "C:\path\to\your\mt5-bars.csv"
+npm run backtest:csv -- "C:\path\to\bars.csv"
 ```
 
 Expected CSV columns:
@@ -328,45 +254,35 @@ Expected CSV columns:
 - `close`
 - optional `spread`
 
-The CSV backtest script:
+The CSV backtester:
 
 - computes EMA, RSI, and ATR internally
-- derives session from hour
-- detects trend bias and pullback setups
-- calls the same `/decision` endpoint
-- simulates SL/TP outcome bar by bar
-- posts trade results back into the learning engine
-- prints JSON summary metrics such as win rate, profit factor, drawdown, and net PnL
+- derives session from bar time
+- detects bias and setup tags
+- calls the same local decision API
+- simulates SL/TP outcomes
+- feeds results back into the learning engine
 
-Useful environment overrides for CSV backtesting:
-
-- `BT_SYMBOL`
-- `BT_TIMEFRAME`
-- `BT_INITIAL_BALANCE`
-- `BT_POINT_SIZE`
-- `BT_RISK_PERCENT_FALLBACK`
+If `DATA_DIR` is not overridden, CSV backtest state is written to `ai-server/src/csv_backtest_state/`.
 
 ## State Files
 
-The server persists its state in JSON files under `ai-server/src/`.
+The server persists JSON state and can also redirect it through `DATA_DIR` or explicit file overrides.
 
-- `trades.json`: closed trades history
-- `pending_trades.json`: open decision context waiting for result feedback
-- `learning_state.json`: global and bucket learning stats
-- `strategy_notes.json`: summarized guidance generated from recent performance
-- `usage_state.json`: estimated model usage and budget tracking
+Primary state files:
 
-Separate state folders are also used for simulation and monthly estimate workflows.
+- `ai-server/src/trades.json`: closed trades history
+- `ai-server/src/pending_trades.json`: decision context waiting for outcome feedback
+- `ai-server/src/learning_state.json`: learning and bucket statistics
+- `ai-server/src/strategy_notes.json`: summarized strategy guidance
+- `ai-server/src/usage_state.json`: estimated model usage and budget tracking
 
-## Notes And Recommendations
+Additional state folders:
 
-- Keep the EA and server secrets synchronized.
-- Start with simulation mode before connecting to a live chart.
-- Review `learning-status`, `usage-status`, and `strategy-notes` regularly. The server now reports per-symbol status for `XAUUSD` and `EURUSD` in the command output and `GET /learning-status`.
-- If performance degrades in a specific bucket, the server may start filtering it aggressively by design.
-- `XAUUSD` remains the primary tuned symbol. `EURUSD` is supported, but you should still review its learning buckets and spread/ATR behavior before increasing risk.
+- `ai-server/src/simulation_state/`
+- `ai-server/src/monthly_estimate_state/`
 
-## Current NPM Scripts
+## NPM Scripts
 
 ```powershell
 npm start
@@ -374,3 +290,11 @@ npm run simulate
 npm run compat-check
 npm run backtest:csv -- "C:\path\to\bars.csv"
 ```
+
+## Operational Notes
+
+- Start with simulation before connecting the EA to live charts.
+- Review `/learning-status`, `/usage-status`, and `/strategy-notes` regularly.
+- `XAUUSD` appears to be the primary tuned symbol in this repo.
+- `EURUSD` is supported, but its live behavior should still be monitored carefully before increasing risk.
+- This project stores runtime state as JSON files, so treat those files as part of the operating environment.
